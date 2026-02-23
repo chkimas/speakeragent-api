@@ -4,11 +4,14 @@ Serves endpoints that the frontend (Vercel/Next.js) calls to display leads.
 Includes APScheduler for daily scout cron job.
 """
 
+import json
 import logging
 import os
 import threading
+import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from datetime import date
+from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,25 +25,57 @@ logger = logging.getLogger(__name__)
 
 # ── Scheduler ───────────────────────────────────────────────
 
-def _run_daily_scout():
-    """Run the scout pipeline as a background job."""
+def _run_scout_for_speaker(speaker_id: str, profile_path: str):
+    """Run scout pipeline for a single speaker."""
     try:
         from src.agent.scout import run_scout
-        settings = Settings()
-        profile_path = settings.SCOUT_PROFILE_PATH
-        speaker_id = settings.SCOUT_SPEAKER_ID
-        logger.info(f"[CRON] Starting daily scout for {speaker_id}")
+        logger.info(f"[SCOUT] Starting scout for {speaker_id}")
         summary = run_scout(
             profile_path=profile_path,
             speaker_id=speaker_id,
         )
         logger.info(
-            f"[CRON] Scout complete: pushed {summary.get('pushed', 0)} leads, "
+            f"[SCOUT] Complete for {speaker_id}: pushed {summary.get('pushed', 0)} leads, "
             f"RED={summary.get('triage_counts', {}).get('RED', 0)} "
             f"YELLOW={summary.get('triage_counts', {}).get('YELLOW', 0)}"
         )
+        return summary
     except Exception as e:
-        logger.error(f"[CRON] Scout failed: {e}", exc_info=True)
+        logger.error(f"[SCOUT] Failed for {speaker_id}: {e}", exc_info=True)
+        return {'error': str(e)}
+
+
+def _run_daily_scout():
+    """Run the scout pipeline for ALL active speakers."""
+    try:
+        settings = Settings()
+        at = AirtableAPI(
+            api_key=settings.AIRTABLE_API_KEY,
+            base_id=settings.AIRTABLE_BASE_ID,
+            leads_table=settings.LEADS_TABLE,
+            speakers_table=settings.SPEAKERS_TABLE,
+        )
+        active_speakers = at.list_active_speakers()
+        if not active_speakers:
+            logger.warning("[CRON] No active speakers found. Falling back to default.")
+            _run_scout_for_speaker(
+                settings.SCOUT_SPEAKER_ID,
+                settings.SCOUT_PROFILE_PATH,
+            )
+            return
+
+        logger.info(f"[CRON] Running daily scout for {len(active_speakers)} active speaker(s)")
+        for record in active_speakers:
+            fields = record.get('fields', {})
+            sid = fields.get('speaker_id', '')
+            if not sid:
+                continue
+            # Use stored profile or fall back to default seed path
+            profile_path = f"config/speaker_profiles/{sid}.json"
+            _run_scout_for_speaker(sid, profile_path)
+
+    except Exception as e:
+        logger.error(f"[CRON] Daily scout failed: {e}", exc_info=True)
 
 
 _scheduler = None
@@ -111,6 +146,19 @@ def get_airtable() -> AirtableAPI:
 
 class StatusUpdate(BaseModel):
     status: str
+
+
+class SpeakerRegistration(BaseModel):
+    full_name: str
+    email: str
+    tagline: Optional[str] = None
+    bio: Optional[str] = None
+    topics: Optional[List[str]] = None
+    target_industries: Optional[List[str]] = None
+    min_honorarium: Optional[int] = None
+    years_experience: Optional[int] = None
+    location: Optional[str] = None
+    website: Optional[str] = None
 
 
 # ── Health ──────────────────────────────────────────────────
@@ -191,14 +239,71 @@ def update_lead_status(lead_id: str, body: StatusUpdate):
 # ── Scout (manual trigger) ─────────────────────────────────
 
 @app.post("/api/scout/run")
-def trigger_scout():
-    """Manually trigger a scout run (runs in background thread)."""
-    thread = threading.Thread(target=_run_daily_scout, daemon=True)
-    thread.start()
-    return {"status": "started", "message": "Scout pipeline running in background"}
+def trigger_scout(speaker_id: Optional[str] = Query(None)):
+    """Manually trigger a scout run. Optionally for a specific speaker."""
+    if speaker_id:
+        profile_path = f"config/speaker_profiles/{speaker_id}.json"
+        thread = threading.Thread(
+            target=_run_scout_for_speaker,
+            args=(speaker_id, profile_path),
+            daemon=True,
+        )
+        thread.start()
+        return {"status": "started", "speaker_id": speaker_id}
+    else:
+        thread = threading.Thread(target=_run_daily_scout, daemon=True)
+        thread.start()
+        return {"status": "started", "message": "Scout running for all active speakers"}
 
 
 # ── Speaker ─────────────────────────────────────────────────
+
+@app.post("/api/speakers/register")
+def register_speaker(body: SpeakerRegistration):
+    """Register a new speaker. Generates a unique speaker_id."""
+    at = get_airtable()
+
+    # Generate unique speaker_id: slug from name + short UUID
+    name_slug = body.full_name.lower().replace(' ', '_').replace('.', '')
+    name_slug = ''.join(c for c in name_slug if c.isalnum() or c == '_')
+    short_uuid = uuid.uuid4().hex[:8]
+    speaker_id = f"{name_slug}_{short_uuid}"
+
+    # Build speaker record
+    fields = {
+        'speaker_id': speaker_id,
+        'full_name': body.full_name,
+        'email': body.email,
+        'status': 'active',
+        'created_at': date.today().isoformat(),
+    }
+    if body.tagline:
+        fields['tagline'] = body.tagline
+    if body.bio:
+        fields['bio'] = body.bio
+    if body.topics:
+        fields['topics'] = json.dumps(body.topics)
+    if body.target_industries:
+        fields['target_industries'] = json.dumps(body.target_industries)
+    if body.min_honorarium is not None:
+        fields['min_honorarium'] = body.min_honorarium
+    if body.years_experience is not None:
+        fields['years_experience'] = body.years_experience
+    if body.location:
+        fields['location'] = body.location
+    if body.website:
+        fields['website'] = body.website
+
+    record = at.create_speaker(fields)
+    if not record:
+        raise HTTPException(status_code=500, detail="Failed to create speaker")
+
+    return {
+        "speaker_id": speaker_id,
+        "id": record["id"],
+        **record.get("fields", {}),
+    }
+
 
 @app.get("/api/speaker/{speaker_id}")
 def get_speaker(speaker_id: str):

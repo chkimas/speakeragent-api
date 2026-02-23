@@ -7,7 +7,7 @@ Handles deduplication, payload cleaning, and field validation.
 import logging
 import requests
 from datetime import date
-from typing import Optional
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -274,4 +274,52 @@ class AirtableAPI:
             return resp.json()
         except Exception as e:
             logger.error(f"Failed to create speaker: {e}")
+            return None
+
+    def speaker_exists(self, speaker_id: str) -> bool:
+        """Check if a speaker_id is already taken."""
+        return self.get_speaker(speaker_id) is not None
+
+    def list_active_speakers(self) -> List[dict]:
+        """Get all speakers with status='active'."""
+        params = {
+            'filterByFormula': "{status} = 'active'",
+        }
+        all_records = []
+        offset = None
+        while True:
+            if offset:
+                params['offset'] = offset
+            try:
+                resp = requests.get(
+                    f'{self.base_url}/{self.speakers_table}',
+                    headers=self.headers,
+                    params=params,
+                    timeout=15
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                all_records.extend(data.get('records', []))
+                offset = data.get('offset')
+                if not offset:
+                    break
+            except Exception as e:
+                logger.error(f"Failed to list active speakers: {e}")
+                break
+        return all_records
+
+    def update_speaker(self, record_id: str, fields: dict) -> Optional[dict]:
+        """Update a speaker record."""
+        payload = {'fields': clean_payload(fields)}
+        try:
+            resp = requests.patch(
+                f'{self.base_url}/{self.speakers_table}/{record_id}',
+                headers=self.headers,
+                json=payload,
+                timeout=10
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to update speaker {record_id}: {e}")
             return None
