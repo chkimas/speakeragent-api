@@ -325,10 +325,18 @@ def _create_profile_and_run_scout(speaker_id: str, body):
             'min_honorarium': body.min_honorarium or 0,
         }
 
-        # Parse credentials from bio if available
+        # Build discussion_points from topic titles for better search queries
+        discussion_points = []
+        for t in (topics if topics else []):
+            # Add the full topic title and its first key phrase
+            discussion_points.append(t)
+            phrase = t.split(':')[0].strip()
+            if phrase != t:
+                discussion_points.append(phrase)
+        profile['discussion_points'] = discussion_points[:10]
+
+        # Store full bio for context
         if body.bio:
-            profile['credentials'] = ''
-            # Store full bio for context
             profile['bio'] = body.bio
 
         # Save profile JSON

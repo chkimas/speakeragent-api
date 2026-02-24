@@ -197,12 +197,20 @@ def generate_search_queries(profile: dict) -> list[str]:
     industries = profile.get('target_industries', [])
     name = profile.get('full_name', '')
 
+    # Ensure industries is never empty — derive from topics/bio if needed
+    if not industries:
+        industries = ['professional']
+
     # Build keyword pool from topics + discussion points
     keywords = []
     for t in topics:
         # Extract key phrase from topic title
         keywords.append(t.split(':')[0].strip())
     keywords.extend(discussion_points[:5])
+
+    # Ensure keywords is never empty
+    if not keywords:
+        keywords = [name or 'speaker']
 
     queries = []
 
