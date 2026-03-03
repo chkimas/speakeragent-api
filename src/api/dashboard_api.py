@@ -17,7 +17,9 @@ from typing import List, Optional
 
 import requests as http_requests
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from config.settings import Settings
@@ -68,7 +70,14 @@ def _ensure_profile_exists(speaker_id: str, profile_path: str) -> str:
             try:
                 topic_list = json.loads(raw_topics) if isinstance(raw_topics, str) else raw_topics
                 for t in topic_list:
-                    topics.append({'topic': t, 'description': ''})
+                    if isinstance(t, dict):
+                        topics.append({
+                            'topic': t.get('title', ''),
+                            'description': t.get('abstract', ''),
+                            'audience': t.get('audience', '')
+                        })
+                    else:
+                        topics.append({'topic': t, 'description': ''})
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -83,7 +92,7 @@ def _ensure_profile_exists(speaker_id: str, profile_path: str) -> str:
 
         profile = {
             'full_name': fields.get('full_name', speaker_id),
-            'credentials': '',
+            'credentials': fields.get('credentials', ''),
             'professional_title': fields.get('tagline', ''),
             'years_experience': fields.get('years_experience', 0),
             'book_title': '',
@@ -92,6 +101,12 @@ def _ensure_profile_exists(speaker_id: str, profile_path: str) -> str:
             'target_geography': fields.get('location', 'National (US)'),
             'min_honorarium': fields.get('min_honorarium', 0),
             'discussion_points': [t['topic'] for t in topics][:10],
+            'linkedin': fields.get('linkedin', ''),
+            'website': fields.get('website', ''),
+            'speaker_sheet': fields.get('speaker_sheet', ''),
+            'notes': fields.get('notes', ''),
+            'conference_year': fields.get('conference_year', date.today().year),
+            'conference_tier': fields.get('conference_tier', ''),
         }
         if fields.get('bio'):
             profile['bio'] = fields['bio']
@@ -206,6 +221,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"Validation error for {request.url}: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+    )
+
 # CORS — driven by CORS_ORIGINS env var (comma-separated)
 _allowed_origins = os.getenv('CORS_ORIGINS', 'http://localhost:3000').split(',')
 _allowed_origins = [o.strip() for o in _allowed_origins if o.strip()]
@@ -241,17 +264,38 @@ class StatusUpdate(BaseModel):
     notes: Optional[str] = None
     updated_by: Optional[str] = None
 
+
+class MessageUpdate(BaseModel):
+    message: str
+    updated_by: Optional[str] = None
+    contact_name: Optional[str] = None
+    contact_email: Optional[str] = None
+
+
+class SpeakerTopic(BaseModel):
+    title: str
+    abstract: Optional[str] = ""
+    audience: Optional[str] = ""
+
+
 class SpeakerUpdate(BaseModel):
     full_name: Optional[str] = None
     email: Optional[str] = None
     tagline: Optional[str] = None
     bio: Optional[str] = None
-    topics: Optional[List[str]] = None
+    topics: Optional[List[SpeakerTopic]] = None
     target_industries: Optional[List[str]] = None
     min_honorarium: Optional[int] = None
     years_experience: Optional[int] = None
     location: Optional[str] = None
     website: Optional[str] = None
+    credentials: Optional[str] = None
+    linkedin: Optional[str] = None
+    speaker_sheet: Optional[str] = None
+    notes: Optional[str] = None
+    conference_year: Optional[int] = None
+    conference_tier: Optional[str] = None
+    attachments: Optional[List[EmailAttachment]] = None
 
 
 class SpeakerRegistration(BaseModel):
@@ -259,12 +303,19 @@ class SpeakerRegistration(BaseModel):
     email: str
     tagline: Optional[str] = None
     bio: Optional[str] = None
-    topics: Optional[List[str]] = None
+    topics: Optional[List[SpeakerTopic]] = None
     target_industries: Optional[List[str]] = None
     min_honorarium: Optional[int] = None
     years_experience: Optional[int] = None
     location: Optional[str] = None
     website: Optional[str] = None
+    credentials: Optional[str] = None
+    linkedin: Optional[str] = None
+    speaker_sheet: Optional[str] = None
+    notes: Optional[str] = None
+    conference_year: Optional[int] = None
+    conference_tier: Optional[str] = None
+    attachments: Optional[List[EmailAttachment]] = None
 
 
 # ── Health ──────────────────────────────────────────────────
@@ -284,11 +335,63 @@ def health_check():
         return {"status": "unhealthy", "error": str(e), "cron_active": cron_active}
 
 
-@app.post("/api/test-email")
-def test_email(email: str = Query(...), speaker_id: str = Query(default="test_123")):
-    """Test endpoint to verify Resend email delivery."""
-    _send_welcome_email(email, "Test User", speaker_id)
-    return {"status": "sent", "to": email, "speaker_id": speaker_id}
+class EmailAttachment(BaseModel):
+    filename: str
+    content: str  # base64-encoded file content
+    type: Optional[str] = "application/octet-stream"
+
+
+class SendEmailRequest(BaseModel):
+    to: List[str]
+    subject: str
+    content: str
+    content_type: Optional[str] = "text/html"
+    attachments: Optional[List[EmailAttachment]] = None
+
+
+@app.post("/api/send-email")
+def send_email(body: SendEmailRequest):
+    """Send an email via SendGrid with optional attachments."""
+    sendgrid_key = os.getenv('SENDGRID_API_KEY', '')
+    if not sendgrid_key:
+        raise HTTPException(status_code=503, detail="SENDGRID_API_KEY not configured")
+
+    email_from = os.getenv('EMAIL_FROM', 'hiring@speakeragent.ai')
+
+    payload = {
+        'personalizations': [{'to': [{'email': addr} for addr in body.to]}],
+        'from': {'email': email_from, 'name': 'SpeakerAgent.AI'},
+        'subject': body.subject,
+        'content': [{'type': body.content_type, 'value': body.content}],
+    }
+
+    if body.attachments:
+        payload['attachments'] = [
+            {'filename': a.filename, 'content': a.content, 'type': a.type}
+            for a in body.attachments
+        ]
+
+    try:
+        resp = http_requests.post(
+            'https://api.sendgrid.com/v3/mail/send',
+            headers={
+                'Authorization': f'Bearer {sendgrid_key}',
+                'Content-Type': 'application/json',
+            },
+            json=payload,
+            timeout=10,
+        )
+        if resp.status_code == 202:
+            logger.info(f"[EMAIL] Sent '{body.subject}' to {body.to}")
+            return {"status": "sent", "to": body.to}
+        else:
+            logger.error(f"[EMAIL] SendGrid error: {resp.status_code} {resp.text}")
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[EMAIL] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ── Leads ───────────────────────────────────────────────────
@@ -348,6 +451,17 @@ def update_lead_status(lead_id: str, body: StatusUpdate):
         raise HTTPException(status_code=500, detail="Failed to update lead")
     return {"id": result["id"], **result.get("fields", {})}
 
+
+@app.put("/api/leads/{lead_id}/message")
+def update_lead_message(lead_id: str, body: MessageUpdate):
+    """Update lead approval message."""
+    at = get_airtable()
+    logger.info(f"Lead {lead_id} updating approval message")
+    result = at.update_lead(lead_id, {'Approval Message': body.message, 'Updated By': body.updated_by or '', 'Update Timestamp': date.today().isoformat(), 'Contact Name': body.contact_name or '', 'Contact Email': body.contact_email or ''})
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to update lead message")
+    return {"id": result["id"], **result.get("fields", {})}
+
 # ── Scout (manual trigger) ─────────────────────────────────
 
 @app.post("/api/scout/run")
@@ -370,48 +484,56 @@ def trigger_scout(speaker_id: Optional[str] = Query(None)):
 
 # ── Email ──────────────────────────────────────────────────
 
-def _send_welcome_email(email: str, full_name: str, speaker_id: str):
-    """Send welcome email with speaker_id using Resend API."""
+def _send_welcome_email(email: str, full_name: str, speaker_id: str, attachments: Optional[List[EmailAttachment]] = None):
+    """Send welcome email with speaker_id using SendGrid API."""
     import sys
     print(f"[EMAIL] Starting welcome email for {speaker_id} to {email}", file=sys.stderr, flush=True)
 
-    resend_key = os.getenv('RESEND_API_KEY', '')
-    if not resend_key:
-        print(f"[EMAIL] No RESEND_API_KEY set. Skipping welcome email for {speaker_id}", file=sys.stderr, flush=True)
+    sendgrid_key = os.getenv('SENDGRID_API_KEY', '')
+    if not sendgrid_key:
+        print(f"[EMAIL] No SENDGRID_API_KEY set. Skipping welcome email for {speaker_id}", file=sys.stderr, flush=True)
         return
 
-    email_from = os.getenv('EMAIL_FROM', 'SpeakerAgent.AI <onboarding@resend.dev>')
+    email_from = os.getenv('EMAIL_FROM', 'noreply@speakeragent.ai')
     frontend_url = os.getenv('FRONTEND_URL', 'https://frontend-production-4a8a.up.railway.app')
 
+    payload = {
+        'personalizations': [{'to': [{'email': email}]}],
+        'from': {'email': email_from, 'name': 'SpeakerAgent.AI'},
+        'subject': 'Welcome to SpeakerAgent.AI — Your Speaker ID',
+        'content': [{'type': 'text/html', 'value': (
+            f'<h2>Welcome to SpeakerAgent.AI, {full_name}!</h2>'
+            f'<p>Your account has been created successfully. Here is your Speaker ID:</p>'
+            f'<div style="background:#f0f4f8;padding:16px 24px;border-radius:8px;text-align:center;margin:24px 0;">'
+            f'<code style="font-size:24px;font-weight:bold;color:#1e40af;">{speaker_id}</code>'
+            f'</div>'
+            f'<p>Use this ID to log in to your dashboard at any time:</p>'
+            f'<p><a href="{frontend_url}/login" style="color:#2563eb;">Open Your Dashboard</a></p>'
+            f'<p>Our AI Scout is now being configured to find speaking engagements matched to your profile. '
+            f'You\'ll start seeing leads in your dashboard soon!</p>'
+            f'<br><p>— The SpeakerAgent.AI Team</p>'
+        )}],
+    }
+
+    if attachments:
+        payload['attachments'] = [
+            {'filename': a.filename, 'content': a.content, 'type': a.type}
+            for a in attachments
+        ]
+
     try:
-        print(f"[EMAIL] Sending via Resend from={email_from} to={email}", file=sys.stderr, flush=True)
+        print(f"[EMAIL] Sending via SendGrid from={email_from} to={email}", file=sys.stderr, flush=True)
         resp = http_requests.post(
-            'https://api.resend.com/emails',
+            'https://api.sendgrid.com/v3/mail/send',
             headers={
-                'Authorization': f'Bearer {resend_key}',
+                'Authorization': f'Bearer {sendgrid_key}',
                 'Content-Type': 'application/json',
             },
-            json={
-                'from': email_from,
-                'to': [email],
-                'subject': f'Welcome to SpeakerAgent.AI — Your Speaker ID',
-                'html': (
-                    f'<h2>Welcome to SpeakerAgent.AI, {full_name}!</h2>'
-                    f'<p>Your account has been created successfully. Here is your Speaker ID:</p>'
-                    f'<div style="background:#f0f4f8;padding:16px 24px;border-radius:8px;text-align:center;margin:24px 0;">'
-                    f'<code style="font-size:24px;font-weight:bold;color:#1e40af;">{speaker_id}</code>'
-                    f'</div>'
-                    f'<p>Use this ID to log in to your dashboard at any time:</p>'
-                    f'<p><a href="{frontend_url}/login" style="color:#2563eb;">Open Your Dashboard</a></p>'
-                    f'<p>Our AI Scout is now being configured to find speaking engagements matched to your profile. '
-                    f'You\'ll start seeing leads in your dashboard soon!</p>'
-                    f'<br><p>— The SpeakerAgent.AI Team</p>'
-                ),
-            },
+            json=payload,
             timeout=10,
         )
-        print(f"[EMAIL] Resend response: {resp.status_code} {resp.text}", file=sys.stderr, flush=True)
-        if resp.status_code in (200, 201):
+        print(f"[EMAIL] SendGrid response: {resp.status_code} {resp.text}", file=sys.stderr, flush=True)
+        if resp.status_code == 202:
             logger.info(f"[EMAIL] Welcome email sent to {email} for {speaker_id}")
         else:
             logger.error(f"[EMAIL] Failed to send: {resp.status_code} {resp.text}")
@@ -427,11 +549,11 @@ def _create_profile_and_run_scout(speaker_id: str, body):
         topics = []
         if body.topics:
             for t in body.topics:
-                topics.append({'topic': t, 'description': ''})
+                topics.append({'topic': t.title, 'description': t.abstract or ''})
 
         profile = {
             'full_name': body.full_name,
-            'credentials': '',
+            'credentials': body.credentials or '',
             'professional_title': body.tagline or '',
             'years_experience': body.years_experience or 0,
             'book_title': '',
@@ -443,8 +565,9 @@ def _create_profile_and_run_scout(speaker_id: str, body):
 
         # Build discussion_points from topic title strings for better search queries
         discussion_points = []
-        topic_strings = body.topics or []
-        for t_str in topic_strings:
+        topic_objects = body.topics or []
+        for t_obj in topic_objects:
+            t_str = t_obj.title
             discussion_points.append(t_str)
             phrase = t_str.split(':')[0].strip()
             if phrase != t_str:
@@ -495,7 +618,7 @@ def register_speaker(body: SpeakerRegistration):
     if body.bio:
         fields['bio'] = body.bio
     if body.topics:
-        fields['topics'] = json.dumps(body.topics)
+        fields['topics'] = json.dumps([t.model_dump() for t in body.topics])
     if body.target_industries:
         fields['target_industries'] = json.dumps(body.target_industries)
     if body.min_honorarium is not None:
@@ -511,10 +634,19 @@ def register_speaker(body: SpeakerRegistration):
     if not record:
         raise HTTPException(status_code=500, detail="Failed to create speaker")
 
+    # Upload attachments to Airtable
+    if body.attachments:
+        attachment_field_name = os.getenv('AIRTABLE_ATTACHMENT_FIELD', 'Attachments')
+        for attachment in body.attachments:
+            try:
+                at.upload_attachment(record["id"], attachment_field_name, attachment.filename, attachment.content, attachment.type or 'application/octet-stream')
+            except Exception as e:
+                logger.error(f"Failed to upload attachment '{attachment.filename}': {e}")
+
     # Send welcome email with speaker_id (non-blocking)
     threading.Thread(
         target=_send_welcome_email,
-        args=(body.email, body.full_name, speaker_id),
+        args=(body.email, body.full_name, speaker_id, body.attachments),
         daemon=True,
     ).start()
 
@@ -544,12 +676,14 @@ def get_speaker(speaker_id: str):
 
 @app.put("/api/speaker/{speaker_id}")
 def update_speaker(speaker_id: str, body: SpeakerUpdate):
+    logger.info(f"Received update for speaker {speaker_id}")
     """Update speaker profile. Only non-None fields are changed."""
     at = get_airtable()
     record = at.get_speaker(speaker_id)
     if not record:
         raise HTTPException(status_code=404, detail="Speaker not found")
 
+    logger.info(f"Updating speaker {speaker_id} with data: {record}")
     record_id = record["id"]
     fields = {}
 
@@ -562,7 +696,7 @@ def update_speaker(speaker_id: str, body: SpeakerUpdate):
     if body.bio is not None:
         fields['bio'] = body.bio
     if body.topics is not None:
-        fields['topics'] = json.dumps(body.topics)
+        fields['topics'] = json.dumps([t.model_dump() for t in body.topics])
     if body.target_industries is not None:
         fields['target_industries'] = json.dumps(body.target_industries)
     if body.min_honorarium is not None:
@@ -573,16 +707,37 @@ def update_speaker(speaker_id: str, body: SpeakerUpdate):
         fields['location'] = body.location
     if body.website is not None:
         fields['website'] = body.website
+    if body.credentials is not None:
+        fields['credentials'] = body.credentials
+    if body.linkedin is not None:
+        fields['linkedin'] = body.linkedin
+    if body.speaker_sheet is not None:
+        fields['speaker_sheet'] = body.speaker_sheet
+    if body.notes is not None:
+        fields['notes'] = body.notes
+    if body.conference_year is not None:
+        fields['conference_year'] = body.conference_year
+    if body.conference_tier is not None:
+        fields['conference_tier'] = body.conference_tier
+    
 
-    if not fields:
+    if not fields and not body.attachments:
         return {"id": record_id, **record.get("fields", {})}
 
-    result = at.update_speaker(record_id, fields)
-    if not result:
-        raise HTTPException(status_code=500, detail="Failed to update speaker")
+    result = record
+    if fields:
+        result = at.update_speaker(record_id, fields)
+        if not result:
+            raise HTTPException(status_code=500, detail="Failed to update speaker")
+        _rebuild_profile_json(speaker_id, result.get("fields", {}))
 
-    # Rebuild profile JSON so scout uses updated data
-    _rebuild_profile_json(speaker_id, result.get("fields", {}))
+    if body.attachments:
+        attachment_field_name = os.getenv('AIRTABLE_ATTACHMENT_FIELD', 'Attachments')
+        for attachment in body.attachments:
+            try:
+                at.upload_attachment(record_id, attachment_field_name, attachment.filename, attachment.content, attachment.type or 'application/octet-stream')
+            except Exception as e:
+                logger.error(f"Failed to upload attachment '{attachment.filename}': {e}")
 
     return {"id": result["id"], **result.get("fields", {})}
 
@@ -596,7 +751,14 @@ def _rebuild_profile_json(speaker_id: str, fields: dict):
             try:
                 topic_list = json.loads(raw_topics) if isinstance(raw_topics, str) else raw_topics
                 for t in topic_list:
-                    topics.append({'topic': t, 'description': ''})
+                    if isinstance(t, dict):
+                        topics.append({
+                            'topic': t.get('title', ''),
+                            'description': t.get('abstract', ''),
+                            'audience': t.get('audience', '')
+                        })
+                    else:
+                        topics.append({'topic': t, 'description': ''})
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -610,7 +772,7 @@ def _rebuild_profile_json(speaker_id: str, fields: dict):
 
         profile = {
             'full_name': fields.get('full_name', speaker_id),
-            'credentials': '',
+            'credentials': fields.get('credentials', ''),
             'professional_title': fields.get('tagline', ''),
             'years_experience': fields.get('years_experience', 0),
             'book_title': '',
@@ -619,6 +781,12 @@ def _rebuild_profile_json(speaker_id: str, fields: dict):
             'target_geography': fields.get('location', 'National (US)'),
             'min_honorarium': fields.get('min_honorarium', 0),
             'discussion_points': [t['topic'] for t in topics][:10],
+            'linkedin': fields.get('linkedin', ''),
+            'website': fields.get('website', ''),
+            'speaker_sheet': fields.get('speaker_sheet', ''),
+            'notes': fields.get('notes', ''),
+            'conference_year': fields.get('conference_year', date.today().year),
+            'conference_tier': fields.get('conference_tier', ''),
         }
         if fields.get('bio'):
             profile['bio'] = fields['bio']
