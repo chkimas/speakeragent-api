@@ -277,6 +277,11 @@ class SpeakerTopic(BaseModel):
     abstract: Optional[str] = ""
     audience: Optional[str] = ""
 
+class EmailAttachment(BaseModel):
+    filename: str
+    content: str  # base64-encoded file content
+    type: Optional[str] = "application/octet-stream"
+
 
 class SpeakerUpdate(BaseModel):
     full_name: Optional[str] = None
@@ -324,12 +329,6 @@ class SpeakerRegistration(BaseModel):
 def health_check():
     cron_active = _scheduler is not None and _scheduler.running if _scheduler else False
     return {"status": "ok", "cron_active": cron_active}
-
-
-class EmailAttachment(BaseModel):
-    filename: str
-    content: str  # base64-encoded file content
-    type: Optional[str] = "application/octet-stream"
 
 
 class SendEmailRequest(BaseModel):
