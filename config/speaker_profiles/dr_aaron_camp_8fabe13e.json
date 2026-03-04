@@ -1,0 +1,41 @@
+{
+  "full_name": "Dr. Aaron Camps",
+  "credentials": "",
+  "professional_title": "",
+  "years_experience": 0,
+  "book_title": "",
+  "topics": [
+    {
+      "topic": "AI Triage: What the ER Teaches Us About Diagnostic Tech",
+      "description": "Drawing on 30+ years in emergency medicine, Dr. Camps examines how AI-assisted diagnostics mirror\u2014and sometimes fail\u2014the split-second triage logic clinicians have always relied on. Attendees leave with a framework for evaluating health tech tools through a frontline clinical lens.",
+      "audience": "Health tech founders, CMOs, digital health product teams"
+    },
+    {
+      "topic": "Telemedicine in the Trauma Bay: Lessons From the Front Lines",
+      "description": "Emergency medicine has quietly become one of the most radical testing grounds for telehealth innovation. Dr. Camps delivers an unfiltered clinical perspective on where telemedicine saves lives\u2014and where it falls dangerously short.",
+      "audience": "Telehealth executives, policy leaders, digital health investors"
+    },
+    {
+      "topic": "Wearables in the Wild: What ER Doctors See That Data Misses",
+      "description": "Patients increasingly arrive in emergency departments armed with wearable data\u2014and clinicians are navigating a new layer of noise versus signal. Dr. Camps offers a grounded, clinical take on the promise and peril of consumer health wearables.",
+      "audience": "Wearable tech companies, digital health innovators, clinical informaticists"
+    }
+  ],
+  "target_industries": [
+    "Health Tech"
+  ],
+  "target_geography": "US",
+  "min_honorarium": 5000,
+  "discussion_points": [
+    "AI Triage: What the ER Teaches Us About Diagnostic Tech",
+    "Telemedicine in the Trauma Bay: Lessons From the Front Lines",
+    "Wearables in the Wild: What ER Doctors See That Data Misses"
+  ],
+  "linkedin": "",
+  "website": "",
+  "speaker_sheet": "",
+  "notes": "",
+  "conference_year": 2026,
+  "conference_tier": "",
+  "bio": "30+ years frontline ER experience. Published author of Never Let Them See You Sweat. Extensive media presence across TV, print, and digital."
+}
