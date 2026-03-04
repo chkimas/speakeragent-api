@@ -270,6 +270,7 @@ class MessageUpdate(BaseModel):
     updated_by: Optional[str] = None
     contact_name: Optional[str] = None
     contact_email: Optional[str] = None
+    subject: Optional[str] = None
 
 
 class SpeakerTopic(BaseModel):
@@ -346,7 +347,7 @@ def send_email(body: SendEmailRequest):
     if not sendgrid_key:
         raise HTTPException(status_code=503, detail="SENDGRID_API_KEY not configured")
 
-    email_from = os.getenv('EMAIL_FROM', 'hiring@speakeragent.ai')
+    email_from = os.getenv('EMAIL_FROM', 'tony@speakeragent.ai')
 
     payload = {
         'personalizations': [{'to': [{'email': addr} for addr in body.to]}],
@@ -435,10 +436,21 @@ def update_lead_status(lead_id: str, body: StatusUpdate):
             detail=f"Invalid status. Must be one of: {', '.join(sorted(VALID_LEAD_STATUSES))}"
         )
     at = get_airtable()
+
+
+
     # logger.info(f"Lead {lead_id} updating status to {body.status}")
     result = at.update_lead(lead_id, {'Lead Status': body.status, 'Update Notes': body.notes or '', 'Updated By': body.updated_by or '', 'Update Timestamp': date.today().isoformat()})
     if not result:
         raise HTTPException(status_code=500, detail="Failed to update lead")
+
+    if body.status == 'Contacted':
+        threading.Thread(
+            target=_send_outreach_email,
+            args=(at, lead_id, result.get('fields', {})),
+            daemon=True,
+        ).start()
+
     return {"id": result["id"], **result.get("fields", {})}
 
 
@@ -447,7 +459,7 @@ def update_lead_message(lead_id: str, body: MessageUpdate):
     """Update lead approval message."""
     at = get_airtable()
     logger.info(f"Lead {lead_id} updating approval message")
-    result = at.update_lead(lead_id, {'Approval Message': body.message, 'Updated By': body.updated_by or '', 'Update Timestamp': date.today().isoformat(), 'Contact Name': body.contact_name or '', 'Contact Email': body.contact_email or ''})
+    result = at.update_lead(lead_id, {'Approval Message': body.message, 'Suggested Talk': body.subject or '', 'Updated By': body.updated_by or '', 'Update Timestamp': date.today().isoformat(), 'Contact Name': body.contact_name or '', 'Contact Email': body.contact_email or ''})
     if not result:
         raise HTTPException(status_code=500, detail="Failed to update lead message")
     return {"id": result["id"], **result.get("fields", {})}
@@ -530,6 +542,49 @@ def _send_welcome_email(email: str, full_name: str, speaker_id: str, attachments
     except Exception as e:
         print(f"[EMAIL] Error: {e}", file=sys.stderr, flush=True)
         logger.error(f"[EMAIL] Error sending welcome email: {e}")
+
+
+def _send_outreach_email(at: AirtableAPI, lead_id: str, fields: dict):
+    """Send outreach email to a conference contact when lead is marked Contacted."""
+    import sys
+
+    contact_email = fields.get('Contact Email', '')
+    if not contact_email:
+        print(f"[EMAIL] No contact email for lead {lead_id}, skipping outreach", file=sys.stderr, flush=True)
+        return
+
+    subject = fields.get('Suggested Talk', 'Speaking Opportunity')
+    contact_name = fields.get('Contact Name', '')
+
+    # Resolve speaker full name
+    speaker_name = 'Speaker'
+    speaker_id = fields.get('speaker_id', '')
+    if speaker_id:
+        try:
+            speaker_record = at.get_speaker(speaker_id)
+            if speaker_record:
+                speaker_name = speaker_record.get('fields', {}).get('full_name', 'Speaker')
+        except Exception as e:
+            print(f"[EMAIL] Failed to get speaker {speaker_id}: {e}", file=sys.stderr, flush=True)
+
+    # Build body
+    body_text = fields.get('Approval Message', '')
+    if not body_text:
+        greeting = f"Dear {contact_name}," if contact_name else "Dear Event Organizer,"
+        hook = fields.get('The Hook', '')
+        cta = fields.get('CTA', '')
+        body_text = f"{greeting}\n\n{hook}\n\n{cta}\n\nWarm regards,\n{speaker_name}"
+
+    try:
+        send_email(SendEmailRequest(
+            to=[contact_email],
+            subject=subject,
+            content=body_text,
+            content_type='text/plain',
+        ))
+        logger.info(f"[EMAIL] Outreach sent for lead {lead_id} to {contact_email}")
+    except Exception as e:
+        logger.error(f"[EMAIL] Error sending outreach for lead {lead_id}: {e}")
 
 
 def _create_profile_and_run_scout(speaker_id: str, body):
