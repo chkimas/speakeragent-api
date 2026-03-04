@@ -568,19 +568,33 @@ def _send_outreach_email(at: AirtableAPI, lead_id: str, fields: dict):
             print(f"[EMAIL] Failed to get speaker {speaker_id}: {e}", file=sys.stderr, flush=True)
 
     # Build body
-    body_text = fields.get('Approval Message', '')
-    if not body_text:
+    approval_message = fields.get('Approval Message', '')
+    if approval_message:
+        # Wrap existing plain-text approval message in styled HTML
+        paragraphs = ''.join(
+            f'<p style="margin:0 0 16px 0;">{line}</p>' if line.strip() else '<br>'
+            for line in approval_message.splitlines()
+        )
+        html_content = f'''<div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;">{paragraphs}</div>'''
+    else:
         greeting = f"Dear {contact_name}," if contact_name else "Dear Event Organizer,"
         hook = fields.get('The Hook', '')
         cta = fields.get('CTA', '')
-        body_text = f"{greeting}\n\n{hook}\n\n{cta}\n\nWarm regards,\n{speaker_name}"
+        html_content = f'''
+<div style="font-family:Arial,sans-serif;font-size:15px;line-height:1.6;color:#1a1a1a;max-width:600px;">
+  <p style="margin:0 0 20px 0;">{greeting}</p>
+  <p style="margin:0 0 20px 0;">{hook}</p>
+  <p style="margin:0 0 28px 0;">{cta}</p>
+  <p style="margin:0 0 4px 0;">Warm regards,</p>
+  <p style="margin:0;font-weight:bold;">{speaker_name}</p>
+</div>'''
 
     try:
         send_email(SendEmailRequest(
             to=[contact_email],
             subject=subject,
-            content=body_text,
-            content_type='text/plain',
+            content=html_content,
+            content_type='text/html',
         ))
         logger.info(f"[EMAIL] Outreach sent for lead {lead_id} to {contact_email}")
     except Exception as e:
@@ -717,6 +731,142 @@ def get_speaker(speaker_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Speaker not found")
     return {"id": record["id"], **record.get("fields", {})}
+
+
+def _fetch_trending_topics_from_serp(industries: list, credentials: str) -> str:
+    """Search SerpAPI for trending conference topics. Returns a formatted context string."""
+    serp_key = os.getenv('SERP_API_KEY', '')
+    if not serp_key:
+        return ''
+
+    industry_str = industries[0] if industries else credentials or 'professional development'
+    queries = [
+        f'trending conference keynote topics 2026 {industry_str}',
+        f'most popular speaker topics {industry_str} conferences 2026',
+    ]
+
+    snippets = []
+    for query in queries:
+        try:
+            resp = http_requests.get(
+                'https://serpapi.com/search.json',
+                params={'q': query, 'api_key': serp_key, 'num': 5, 'hl': 'en', 'gl': 'us'},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[TOPICS] SerpAPI {resp.status_code} for: {query}")
+                continue
+            for r in resp.json().get('organic_results', [])[:5]:
+                title = r.get('title', '')
+                snippet = r.get('snippet', '')
+                if title or snippet:
+                    snippets.append(f"- {title}: {snippet}")
+        except Exception as e:
+            logger.warning(f"[TOPICS] SerpAPI failed for '{query}': {e}")
+
+    if not snippets:
+        return ''
+
+    return "REAL-WORLD TRENDING TOPICS FROM WEB (use as grounding):\n" + '\n'.join(snippets[:10])
+
+
+@app.get("/api/topics")
+def suggest_topics(speaker_id: str = Query(...)):
+    """Generate AI-powered topic suggestions grounded in real-time web trends via SerpAPI."""
+    at = get_airtable()
+    record = at.get_speaker(speaker_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Speaker not found")
+
+    fields = record.get('fields', {})
+
+    # Parse existing topics
+    existing_topics = []
+    raw_topics = fields.get('topics', '')
+    if raw_topics:
+        try:
+            topic_list = json.loads(raw_topics) if isinstance(raw_topics, str) else raw_topics
+            existing_topics = [t.get('title', '') for t in topic_list if isinstance(t, dict)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Parse target industries
+    industries = []
+    raw_ind = fields.get('target_industries', '')
+    if raw_ind:
+        try:
+            industries = json.loads(raw_ind) if isinstance(raw_ind, str) else raw_ind
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    full_name = fields.get('full_name', 'the speaker')
+    tagline = fields.get('tagline', '')
+    credentials = fields.get('credentials', '')
+    bio = (fields.get('bio', '') or '')[:600]
+    years_exp = fields.get('years_experience', '')
+    existing_str = ', '.join(existing_topics) if existing_topics else 'None provided'
+    industries_str = ', '.join(industries) if industries else 'General'
+
+    # Fetch live trending data from SerpAPI
+    serp_context = _fetch_trending_topics_from_serp(industries, credentials)
+    logger.info(f"[TOPICS] SerpAPI context {'fetched' if serp_context else 'unavailable'} for {speaker_id}")
+
+    prompt = f"""You are a speaking industry expert helping identify high-demand conference topics.
+
+SPEAKER PROFILE:
+- Name: {full_name}
+- Title: {tagline}
+- Credentials: {credentials}
+- Years of Experience: {years_exp}
+- Target Industries: {industries_str}
+- Bio: {bio}
+- Existing Topics: {existing_str}
+
+{serp_context}
+
+Generate 10 trending, high-demand conference topic suggestions tailored to this speaker's expertise. Topics should be:
+1. Grounded in what's actually trending at conferences right now (use the web data above if provided)
+2. Different from their existing topics
+3. Specific and compelling, not generic
+4. Tied to real industry trends the speaker is credibly positioned to speak on
+
+Return ONLY a valid JSON array with exactly 10 objects, each with:
+- "title": concise topic name (5-10 words)
+- "abstract": 1-2 sentences max (keep brief)
+- "audience": who this is best suited for (one line)
+- "trend": one sentence on why this topic is in demand right now
+
+Return JSON only, no markdown, no extra text."""
+
+    api_key = os.getenv('CLAUDE_API_KEY', '')
+    model = os.getenv('CLAUDE_MODEL', 'claude-sonnet-4-6')
+    if not api_key:
+        raise HTTPException(status_code=503, detail="CLAUDE_API_KEY not configured")
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=model,
+            max_tokens=10000,
+            messages=[{'role': 'user', 'content': prompt}]
+        )
+        text = response.content[0].text.strip()
+        logger.info(f"[TOPICS] Claude stop_reason={response.stop_reason}, length={len(text)}")
+        # Extract JSON array robustly — find first '[' and last ']'
+        start = text.find('[')
+        end = text.rfind(']')
+        if start == -1 or end == -1:
+            logger.error(f"[TOPICS] No JSON array in Claude response: {text[:1000]}")
+            raise json.JSONDecodeError("No JSON array found in response", text, 0)
+        topics = json.loads(text[start:end + 1])
+        return {"speaker_id": speaker_id, "topics": topics, "web_grounded": bool(serp_context)}
+    except json.JSONDecodeError as e:
+        logger.error(f"[TOPICS] Failed to parse Claude response for {speaker_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to parse AI response")
+    except Exception as e:
+        logger.error(f"[TOPICS] Error generating topics for {speaker_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.put("/api/speaker/{speaker_id}")
@@ -865,7 +1015,7 @@ def dashboard(speaker_id: str, status: Optional[str] = Query(None)):
     )
     top_leads = [
         {"id": r["id"], **r.get("fields", {})}
-        for r in sorted_leads[:5]
+        for r in sorted_leads[:5] 
     ]
 
     # Speaker profile
