@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import List, Optional
 
 import requests as http_requests
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.security import APIKeyHeader
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -44,6 +45,15 @@ def _configure_logging():
 
 VALID_LEAD_STATUSES = {'New', 'Contacted', 'Replied', 'Booked', 'Passed', 'Rejected'}
 
+_api_key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
+
+def verify_api_key(key: Optional[str] = Depends(_api_key_header)):
+    """Require a valid X-API-Key header on protected endpoints."""
+    expected = Settings.API_KEY
+    if not expected:
+        raise HTTPException(status_code=503, detail="API_KEY not configured")
+    if key != expected:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # ── Scheduler ───────────────────────────────────────────────
@@ -126,16 +136,82 @@ def _ensure_profile_exists(speaker_id: str, profile_path: str) -> str:
     return profile_path
 
 
+_TIER_MAX_LEADS = {
+    'Free': 3,
+    'Starter': 10,
+    'Pro': 20,
+}
+
+
+def _check_and_reset_plan(speaker_id: str) -> Optional[tuple]:
+    """Check the speaker's weekly scout quota, resetting if 7 days have passed.
+
+    Returns (record, max_scouts, scouts_used) if the speaker can run a scout,
+    or None if they have exhausted their weekly quota.
+    """
+    from datetime import datetime
+    try:
+        at = get_airtable()
+        record = at.get_speaker(speaker_id)
+        if not record:
+            logger.warning(f"[PLAN] Speaker {speaker_id} not found, skipping plan check")
+            return None
+
+        fields = record.get('fields', {})
+        tier = (fields.get('Plan') or '').strip()
+        max_scouts = _TIER_MAX_LEADS.get(tier, Settings.MAX_LEADS_PER_RUN)
+        scouts_used = int(fields.get('scouts_used') or 0)
+        reset_date_str = fields.get('scouts_reset_date') or ''
+
+        # Determine if weekly reset is due
+        today = date.today()
+        needs_reset = True
+        if reset_date_str:
+            try:
+                reset_date = datetime.strptime(reset_date_str[:10], '%Y-%m-%d').date()
+                needs_reset = (today - reset_date).days >= 7
+            except ValueError:
+                pass
+
+        if needs_reset:
+            scouts_used = 0
+            at.update_speaker(record['id'], {
+                'scouts_used': 0,
+                'scouts_reset_date': today.isoformat(),
+            })
+            logger.info(f"[PLAN] Weekly reset for {speaker_id}: scouts_used → 0, reset_date → {today}")
+
+        if scouts_used >= max_scouts:
+            logger.info(f"[PLAN] {speaker_id} quota exhausted: {scouts_used}/{max_scouts} (tier={tier})")
+            return None
+
+        logger.info(f"[PLAN] {speaker_id} tier={tier} scouts={scouts_used}/{max_scouts} — allowed")
+        return record, max_scouts, scouts_used
+
+    except Exception as e:
+        logger.warning(f"[PLAN] Plan check failed for {speaker_id}: {e}")
+        return None
+
+
 def _run_scout_for_speaker(speaker_id: str, profile_path: str):
     """Run scout pipeline for a single speaker."""
     try:
         from src.agent.scout import run_scout
         # Ensure profile exists (rebuild from Airtable if container was redeployed)
         profile_path = _ensure_profile_exists(speaker_id, profile_path)
+
+        # Check plan quota (weekly reset included)
+        plan = _check_and_reset_plan(speaker_id)
+        if plan is None:
+            logger.info(f"[SCOUT] Skipping {speaker_id}: weekly quota exhausted or no plan")
+            return {'skipped': 'quota_exhausted'}
+        record, max_scouts, scouts_used = plan
+
         logger.info(f"[SCOUT] Starting scout for {speaker_id} with profile {profile_path}")
         summary = run_scout(
             profile_path=profile_path,
             speaker_id=speaker_id,
+            max_leads=max_scouts,
         )
         logger.info(
             f"[SCOUT] Complete for {speaker_id}: "
@@ -147,6 +223,16 @@ def _run_scout_for_speaker(speaker_id: str, profile_path: str):
             f"scrape_fail={summary.get('skipped_scrape_fail', 0)} "
             f"score_fail={summary.get('skipped_score_fail', 0)}"
         )
+
+        # Increment scouts_used in Airtable
+        at = get_airtable()
+        new_count = scouts_used + 1
+        update_result = at.update_speaker(record['id'], {'scouts_used': new_count})
+        if update_result:
+            logger.info(f"[SCOUT] scouts_used updated to {new_count} for {speaker_id}")
+        else:
+            logger.warning(f"[SCOUT] Failed to update scouts_used for {speaker_id} — check Airtable field name/type")
+
         return summary
     except Exception as e:
         logger.error(f"[SCOUT] Failed for {speaker_id}: {e}", exc_info=True)
@@ -344,7 +430,7 @@ class SendEmailRequest(BaseModel):
 
 
 @app.post("/api/send-email")
-def send_email(body: SendEmailRequest):
+def send_email(body: SendEmailRequest, _: None = Depends(verify_api_key)):
     """Send an email via SendGrid with optional attachments."""
     sendgrid_key = os.getenv('SENDGRID_API_KEY', '')
     if not sendgrid_key:
@@ -397,6 +483,7 @@ def list_leads(
     speaker_id: str = Query(..., description="Speaker ID to filter by"),
     status: Optional[str] = Query(None),
     triage: Optional[str] = Query(None),
+    _: None = Depends(verify_api_key),
 ):
     """Get all leads for a speaker, with optional filters."""
     at = get_airtable()
@@ -415,7 +502,7 @@ def list_leads(
 
 
 @app.get("/api/leads/stats")
-def lead_stats(speaker_id: str = Query(...)):
+def lead_stats(speaker_id: str = Query(...), _: None = Depends(verify_api_key)):
     """Aggregated lead statistics for a speaker."""
     at = get_airtable()
     stats = at.get_lead_stats(speaker_id)
@@ -423,7 +510,7 @@ def lead_stats(speaker_id: str = Query(...)):
 
 
 @app.get("/api/leads/{lead_id}")
-def get_lead(lead_id: str):
+def get_lead(lead_id: str, _: None = Depends(verify_api_key)):
     """Get a single lead by Airtable record ID."""
     at = get_airtable()
     record = at.get_lead_by_id(lead_id)
@@ -433,7 +520,7 @@ def get_lead(lead_id: str):
 
 
 @app.put("/api/leads/{lead_id}/status")
-def update_lead_status(lead_id: str, body: StatusUpdate):
+def update_lead_status(lead_id: str, body: StatusUpdate, _: None = Depends(verify_api_key)):
     """Update lead status (New -> Contacted -> Replied -> Booked -> Passed -> Rejected)."""
     if body.status not in VALID_LEAD_STATUSES:
         raise HTTPException(
@@ -460,7 +547,7 @@ def update_lead_status(lead_id: str, body: StatusUpdate):
 
 
 @app.put("/api/leads/{lead_id}/message")
-def update_lead_message(lead_id: str, body: MessageUpdate):
+def update_lead_message(lead_id: str, body: MessageUpdate, _: None = Depends(verify_api_key)):
     """Update lead approval message."""
     at = get_airtable()
     logger.info(f"Lead {lead_id} updating approval message")
@@ -472,9 +559,19 @@ def update_lead_message(lead_id: str, body: MessageUpdate):
 # ── Scout (manual trigger) ─────────────────────────────────
 
 @app.post("/api/scout/run")
-def trigger_scout(speaker_id: Optional[str] = Query(None)):
+def trigger_scout(speaker_id: Optional[str] = Query(None), _: None = Depends(verify_api_key)):
     """Manually trigger a scout run. Optionally for a specific speaker."""
     if speaker_id:
+        plan_info = _check_and_reset_plan(speaker_id)
+        if plan_info is None:
+            raise HTTPException(status_code=429, detail="Scout quota exhausted for this billing period")
+        _, max_scouts, scouts_used = plan_info
+        remaining = max_scouts - scouts_used
+        if remaining <= 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Scout quota exhausted ({scouts_used}/{max_scouts} used). Resets weekly.",
+            )
         profile_path = f"config/speaker_profiles/{speaker_id}.json"
         thread = threading.Thread(
             target=_run_scout_for_speaker,
@@ -482,7 +579,7 @@ def trigger_scout(speaker_id: Optional[str] = Query(None)):
             daemon=True,
         )
         thread.start()
-        return {"status": "started", "speaker_id": speaker_id}
+        return {"status": "started", "speaker_id": speaker_id, "scouts_remaining": remaining - 1}
     else:
         thread = threading.Thread(target=_run_daily_scout, daemon=True)
         thread.start()
@@ -711,15 +808,38 @@ def register_speaker(body: SpeakerRegistration):
 
 
 @app.get("/api/speaker/{speaker_id}")
-def get_speaker(speaker_id: str):
+def get_speaker(speaker_id: str, _: None = Depends(verify_api_key)):
     """Get speaker profile from Airtable."""
     logger.info(f"Fetching speaker {speaker_id} from Airtable")
-    print(f"Fetching speaker {speaker_id} from Airtable")
     at = get_airtable()
     record = at.get_speaker(speaker_id)
     if not record:
-        raise HTTPException(status_code=404, detail="Speaker not foundxx")
-    return {"id": record["id"], **record.get("fields", {})}
+        raise HTTPException(status_code=404, detail="Speaker not found")
+    fields = record.get("fields", {})
+    result = {"id": record["id"], **fields}
+
+    # If speaker has a tier, include plan limits and current scouts used
+    tier = (fields.get('Plan') or '').strip()
+    if tier in _TIER_MAX_LEADS:
+        from datetime import datetime, timedelta
+        max_scouts = _TIER_MAX_LEADS[tier]
+        scouts_used = int(fields.get('scouts_used') or 0)
+        reset_date_str = fields.get('scouts_reset_date') or ''
+        resets_at = None
+        try:
+            reset_date = datetime.strptime(reset_date_str[:10], '%Y-%m-%d').date()
+            resets_at = (reset_date + timedelta(days=7)).isoformat()
+        except (ValueError, TypeError):
+            pass
+        result['plan'] = {
+            'tier': tier,
+            'max_scouts': max_scouts,
+            'scouts_used': scouts_used,
+            'scouts_remaining': max(0, max_scouts - scouts_used),
+            'resets_at': resets_at,
+        }
+
+    return result
 
 
 def _fetch_trending_topics(industries: list, credentials: str) -> str:
@@ -801,7 +921,7 @@ def _fetch_trending_topics_serper(queries: list) -> list:
 
 
 @app.get("/api/topics")
-def suggest_topics(speaker_id: str = Query(...)):
+def suggest_topics(speaker_id: str = Query(...), _: None = Depends(verify_api_key)):
     """Generate AI-powered topic suggestions grounded in real-time web trends via SerpAPI."""
     at = get_airtable()
     record = at.get_speaker(speaker_id)
@@ -900,7 +1020,7 @@ Return JSON only, no markdown, no extra text."""
 
 
 @app.put("/api/speaker/{speaker_id}")
-def update_speaker(speaker_id: str, body: SpeakerUpdate):
+def update_speaker(speaker_id: str, body: SpeakerUpdate, _: None = Depends(verify_api_key)):
     logger.info(f"Received update for speaker {speaker_id}")
     """Update speaker profile. Only non-None fields are changed."""
     at = get_airtable()
@@ -1029,7 +1149,7 @@ def _rebuild_profile_json(speaker_id: str, fields: dict):
 # ── Dashboard (combined) ────────────────────────────────────
 
 @app.get("/api/dashboard/{speaker_id}")
-def dashboard(speaker_id: str, status: Optional[str] = Query(None)):
+def dashboard(speaker_id: str, status: Optional[str] = Query(None), _: None = Depends(verify_api_key)):
     """Combined dashboard data: profile + stats + top leads."""
     at = get_airtable()
 

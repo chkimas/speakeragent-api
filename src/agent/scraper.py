@@ -215,8 +215,8 @@ def generate_search_queries(profile: dict) -> list[str]:
         keywords = [name or 'speaker']
 
     queries = []
-    # Use current year + 1 or just hardcode for now as per original
-    year = "2026"
+    # Use conference_year from profile if set, otherwise fall back to current year
+    year = str(profile.get('conference_year') or __import__('datetime').date.today().year)
 
     # 1. Conferences (Traditional)
     for i in range(3):

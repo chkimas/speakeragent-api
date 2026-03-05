@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 
 class Settings:
@@ -20,6 +20,9 @@ class Settings:
 
     # Deployment / CORS
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', 'http://localhost:3000')
+
+    # API key for authenticating frontend/client requests
+    API_KEY = os.getenv('API_KEY', '')
 
     # Admin
     ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', '')

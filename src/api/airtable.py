@@ -22,7 +22,7 @@ def clean_payload(fields: dict) -> dict:
     cleaned = {}
     # These Airtable fields are dateTime type — need ISO 8601 with time
     datetime_fields = {'Date Found', 'Event Date', 'created_at'}
-    number_fields = {'Match Score', 'years_experience', 'min_honorarium'}
+    number_fields = {'Match Score', 'years_experience', 'min_honorarium', 'scouts_used'}
 
     for key, value in fields.items():
         if value is None or value == '' or value == 'TBD' or value == 'N/A':
