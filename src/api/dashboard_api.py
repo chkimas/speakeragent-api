@@ -556,6 +556,44 @@ def update_lead_message(lead_id: str, body: MessageUpdate, _: None = Depends(ver
         raise HTTPException(status_code=500, detail="Failed to update lead message")
     return {"id": result["id"], **result.get("fields", {})}
 
+# ── Directory builder (multi-agent) ────────────────────────
+
+def _run_build_directory(profile_path: str, output_path: str):
+    """Background task: run the multi-agent directory builder."""
+    try:
+        from scripts.build_directory import build_directory
+        result = build_directory(profile_path=profile_path, output_path=output_path)
+        logger.info(f"[DIRECTORY] Built {len(result.get('urls', []))} URLs → {output_path}")
+    except Exception as e:
+        logger.error(f"[DIRECTORY] Build failed: {e}", exc_info=True)
+
+
+@app.post("/api/directory/build")
+def trigger_directory_build(
+    speaker_id: Optional[str] = Query(None),
+    _: None = Depends(verify_api_key),
+):
+    """Trigger the multi-agent directory builder for a speaker profile."""
+    sid = speaker_id or Settings.SCOUT_SPEAKER_ID
+    profile_path = f"config/speaker_profiles/{sid}.json"
+    output_path = "config/seed_urls.json"
+    if not Path(profile_path).exists():
+        raise HTTPException(status_code=404, detail=f"Profile not found: {profile_path}")
+    thread = threading.Thread(
+        target=_run_build_directory,
+        args=(profile_path, output_path),
+        daemon=True,
+    )
+    thread.start()
+    return {
+        "status": "started",
+        "speaker_id": sid,
+        "profile_path": profile_path,
+        "output_path": output_path,
+        "message": "Multi-agent directory build running in background (researcher → devil's advocate → editor)",
+    }
+
+
 # ── Scout (manual trigger) ─────────────────────────────────
 
 @app.post("/api/scout/run")
