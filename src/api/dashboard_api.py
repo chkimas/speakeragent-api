@@ -136,18 +136,26 @@ def _ensure_profile_exists(speaker_id: str, profile_path: str) -> str:
     return profile_path
 
 
+# Max scout RUNS per week per tier
+_TIER_MAX_SCOUTS = {
+    'Free': 1,
+    'Starter': 3,
+    'Pro': 8,
+}
+
+# Max LEADS returned per scout run per tier
 _TIER_MAX_LEADS = {
-    'Free': 3,
+    'Free': 5,
     'Starter': 10,
-    'Pro': 20,
+    'Pro': 25,
 }
 
 
 def _check_and_reset_plan(speaker_id: str) -> Optional[tuple]:
     """Check the speaker's weekly scout quota, resetting if 7 days have passed.
 
-    Returns (record, max_scouts, scouts_used) if the speaker can run a scout,
-    or None if they have exhausted their weekly quota.
+    Returns (record, max_scout_runs, scouts_used, max_leads_per_run) if allowed,
+    or None if the weekly run quota is exhausted.
     """
     from datetime import datetime
     try:
@@ -159,7 +167,8 @@ def _check_and_reset_plan(speaker_id: str) -> Optional[tuple]:
 
         fields = record.get('fields', {})
         tier = (fields.get('Plan') or '').strip()
-        max_scouts = _TIER_MAX_LEADS.get(tier, Settings.MAX_LEADS_PER_RUN)
+        max_scout_runs = _TIER_MAX_SCOUTS.get(tier, 1)
+        max_leads_per_run = _TIER_MAX_LEADS.get(tier, Settings.MAX_LEADS_PER_RUN)
         scouts_used = int(fields.get('scouts_used') or 0)
         reset_date_str = fields.get('scouts_reset_date') or ''
 
@@ -181,12 +190,12 @@ def _check_and_reset_plan(speaker_id: str) -> Optional[tuple]:
             })
             logger.info(f"[PLAN] Weekly reset for {speaker_id}: scouts_used → 0, reset_date → {today}")
 
-        if scouts_used >= max_scouts:
-            logger.info(f"[PLAN] {speaker_id} quota exhausted: {scouts_used}/{max_scouts} (tier={tier})")
+        if scouts_used >= max_scout_runs:
+            logger.info(f"[PLAN] {speaker_id} quota exhausted: {scouts_used}/{max_scout_runs} runs (tier={tier})")
             return None
 
-        logger.info(f"[PLAN] {speaker_id} tier={tier} scouts={scouts_used}/{max_scouts} — allowed")
-        return record, max_scouts, scouts_used
+        logger.info(f"[PLAN] {speaker_id} tier={tier} runs={scouts_used}/{max_scout_runs} leads_per_run={max_leads_per_run} — allowed")
+        return record, max_scout_runs, scouts_used, max_leads_per_run
 
     except Exception as e:
         logger.warning(f"[PLAN] Plan check failed for {speaker_id}: {e}")
@@ -205,13 +214,13 @@ def _run_scout_for_speaker(speaker_id: str, profile_path: str):
         if plan is None:
             logger.info(f"[SCOUT] Skipping {speaker_id}: weekly quota exhausted or no plan")
             return {'skipped': 'quota_exhausted'}
-        record, max_scouts, scouts_used = plan
+        record, _, scouts_used, max_leads_per_run = plan
 
         logger.info(f"[SCOUT] Starting scout for {speaker_id} with profile {profile_path}")
         summary = run_scout(
             profile_path=profile_path,
             speaker_id=speaker_id,
-            max_leads=max_scouts,
+            max_leads=max_leads_per_run,
         )
         logger.info(
             f"[SCOUT] Complete for {speaker_id}: "
@@ -389,6 +398,7 @@ class SpeakerUpdate(BaseModel):
     notes: Optional[str] = None
     conference_year: Optional[int] = None
     conference_tier: Optional[str] = None
+    zip_code: Optional[str] = None
     attachments: Optional[List[EmailAttachment]] = None
 
 
@@ -409,6 +419,7 @@ class SpeakerRegistration(BaseModel):
     notes: Optional[str] = None
     conference_year: Optional[int] = None
     conference_tier: Optional[str] = None
+    zip_code: Optional[str] = None
     attachments: Optional[List[EmailAttachment]] = None
 
 
@@ -603,12 +614,12 @@ def trigger_scout(speaker_id: Optional[str] = Query(None), _: None = Depends(ver
         plan_info = _check_and_reset_plan(speaker_id)
         if plan_info is None:
             raise HTTPException(status_code=429, detail="Scout quota exhausted for this billing period")
-        _, max_scouts, scouts_used = plan_info
-        remaining = max_scouts - scouts_used
+        _, max_scout_runs, scouts_used, _ = plan_info
+        remaining = max_scout_runs - scouts_used
         if remaining <= 0:
             raise HTTPException(
                 status_code=429,
-                detail=f"Scout quota exhausted ({scouts_used}/{max_scouts} used). Resets weekly.",
+                detail=f"Scout quota exhausted ({scouts_used}/{max_scout_runs} runs used). Resets weekly.",
             )
         profile_path = f"config/speaker_profiles/{speaker_id}.json"
         thread = threading.Thread(
@@ -825,6 +836,8 @@ def register_speaker(body: SpeakerRegistration):
         fields['conference_year'] = body.conference_year
     if body.conference_tier:
         fields['conference_tier'] = body.conference_tier
+    if body.zip_code:
+        fields['zip_code'] = body.zip_code
 
     record = at.create_speaker(fields)
     if not record:
@@ -882,7 +895,8 @@ def get_speaker(speaker_id: str, _: None = Depends(verify_api_key)):
     tier = (fields.get('Plan') or '').strip()
     if tier in _TIER_MAX_LEADS:
         from datetime import datetime, timedelta
-        max_scouts = _TIER_MAX_LEADS[tier]
+        max_scout_runs = _TIER_MAX_SCOUTS[tier]
+        max_leads_per_run = _TIER_MAX_LEADS[tier]
         scouts_used = int(fields.get('scouts_used') or 0)
         reset_date_str = fields.get('scouts_reset_date') or ''
         resets_at = None
@@ -893,9 +907,10 @@ def get_speaker(speaker_id: str, _: None = Depends(verify_api_key)):
             pass
         result['plan'] = {
             'tier': tier,
-            'max_scouts': max_scouts,
+            'max_scout_runs': max_scout_runs,
+            'max_leads_per_run': max_leads_per_run,
             'scouts_used': scouts_used,
-            'scouts_remaining': max(0, max_scouts - scouts_used),
+            'scouts_remaining': max(0, max_scout_runs - scouts_used),
             'resets_at': resets_at,
         }
 
@@ -1079,6 +1094,37 @@ Return JSON only, no markdown, no extra text."""
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.put("/api/speaker/{speaker_id}/plan")
+def update_speaker_plan(speaker_id: str, _: None = Depends(verify_api_key), tier: str = Query(...)):
+    """Update a speaker's plan tier. Resets scouts_used and scouts_reset_date."""
+    if tier not in _TIER_MAX_SCOUTS:
+        valid = ', '.join(_TIER_MAX_SCOUTS.keys())
+        raise HTTPException(status_code=400, detail=f"Invalid tier '{tier}'. Must be one of: {valid}")
+
+    at = get_airtable()
+    record = at.get_speaker(speaker_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Speaker not found")
+
+    result = at.update_speaker(record['id'], {
+        'Plan': tier,
+        'scouts_used': 0,
+        'scouts_reset_date': date.today().isoformat(),
+    })
+    if not result:
+        raise HTTPException(status_code=500, detail="Failed to update plan")
+
+    logger.info(f"[PLAN] Speaker {speaker_id} plan updated to {tier}")
+    return {
+        "speaker_id": speaker_id,
+        "tier": tier,
+        "max_scout_runs": _TIER_MAX_SCOUTS[tier],
+        "max_leads_per_run": _TIER_MAX_LEADS[tier],
+        "scouts_used": 0,
+        "scouts_reset_date": date.today().isoformat(),
+    }
+
+
 @app.put("/api/speaker/{speaker_id}")
 def update_speaker(speaker_id: str, body: SpeakerUpdate, _: None = Depends(verify_api_key)):
     logger.info(f"Received update for speaker {speaker_id}")
@@ -1088,6 +1134,7 @@ def update_speaker(speaker_id: str, body: SpeakerUpdate, _: None = Depends(verif
     if not record:
         raise HTTPException(status_code=404, detail="Speaker not found")
 
+    # logger.info(f"request body: {body}")
     logger.info(f"Updating speaker {speaker_id} with data: {record}")
     record_id = record["id"]
     fields = {}
@@ -1124,7 +1171,8 @@ def update_speaker(speaker_id: str, body: SpeakerUpdate, _: None = Depends(verif
         fields['conference_year'] = body.conference_year
     if body.conference_tier is not None:
         fields['conference_tier'] = body.conference_tier
-    
+    if body.zip_code is not None:
+        fields['zip_code'] = body.zip_code
 
     if not fields and not body.attachments:
         return {"id": record_id, **record.get("fields", {})}
@@ -1137,12 +1185,19 @@ def update_speaker(speaker_id: str, body: SpeakerUpdate, _: None = Depends(verif
         _rebuild_profile_json(speaker_id, result.get("fields", {}))
 
     if body.attachments:
-        attachment_field_name = os.getenv('AIRTABLE_ATTACHMENT_FIELD', 'Attachments')
-        for attachment in body.attachments:
-            try:
-                at.upload_attachment(record_id, attachment_field_name, attachment.filename, attachment.content, attachment.type or 'application/octet-stream')
-            except Exception as e:
-                logger.error(f"Failed to upload attachment '{attachment.filename}': {e}")
+        def _upload_attachments(rid: str, attachments):
+            field_name = os.getenv('AIRTABLE_ATTACHMENT_FIELD', 'Attachments')
+            _at = get_airtable()
+            for attachment in attachments:
+                try:
+                    _at.upload_attachment(rid, field_name, attachment.filename, attachment.content, attachment.type or 'application/octet-stream')
+                except Exception as e:
+                    logger.error(f"Failed to upload attachment '{attachment.filename}': {e}")
+        threading.Thread(
+            target=_upload_attachments,
+            args=(record_id, body.attachments),
+            daemon=True,
+        ).start()
 
     return {"id": result["id"], **result.get("fields", {})}
 
@@ -1192,6 +1247,7 @@ def _rebuild_profile_json(speaker_id: str, fields: dict):
             'notes': fields.get('notes', ''),
             'conference_year': fields.get('conference_year', date.today().year),
             'conference_tier': fields.get('conference_tier', ''),
+            'zip_code': fields.get('zip_code', ''),
         }
         if fields.get('bio'):
             profile['bio'] = fields['bio']
@@ -1360,17 +1416,13 @@ def dashboard(speaker_id: str, status: Optional[str] = Query(None), _: None = De
     # Stats
     stats = at.get_lead_stats(speaker_id)
 
-    # Top 5 leads by score
     all_leads = at.get_leads(speaker_id=speaker_id, status=status or '')
     sorted_leads = sorted(
         all_leads,
         key=lambda r: r.get('fields', {}).get('Match Score', 0),
         reverse=True,
     )
-    top_leads = [
-        {"id": r["id"], **r.get("fields", {})}
-        for r in sorted_leads[:5] 
-    ]
+    top_leads = [{"id": r["id"], **r.get("fields", {})} for r in sorted_leads]
 
     # Speaker profile
     speaker = at.get_speaker(speaker_id)

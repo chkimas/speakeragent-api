@@ -341,7 +341,10 @@ class AirtableAPI:
             resp.raise_for_status()
             return resp.json()
         except Exception as e:
-            logger.error(f"Failed to update speaker {record_id}: {e}")
+            try:
+                logger.error(f"Failed to update speaker {record_id}: {e} | response: {resp.text}")
+            except Exception:
+                logger.error(f"Failed to update speaker {record_id}: {e}")
             return None
 
     def get_attachment_field_id(self, table_name: str, field_name: str) -> Optional[str]:

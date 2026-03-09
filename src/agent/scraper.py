@@ -193,79 +193,145 @@ def scrape_page(url: str, timeout: int = 10) -> Optional[dict]:
 
 def generate_search_queries(profile: dict) -> list[str]:
     """Generate search queries for conferences, podcasts, corporate events, and local gigs."""
-    topics = [t['topic'] for t in profile.get('topics', [])]
+    import datetime as _dt
+    import re as _re
+
+    topics = profile.get('topics', [])
     discussion_points = profile.get('discussion_points', [])
     industries = profile.get('target_industries', [])
     name = profile.get('full_name', '')
     geo = profile.get('target_geography', 'US')
+    title = profile.get('professional_title', '')
+    credentials = profile.get('credentials', '')
+    book_title = profile.get('book_title', '')
+    bio = profile.get('bio', '')
+    conference_tier = (profile.get('conference_tier') or '').lower()
+    year = str(profile.get('conference_year') or _dt.date.today().year)
+    zip_code = profile.get('zip_code', '')
 
-    # Ensure industries is never empty — derive from topics/bio if needed
+    # ── Keyword pool ─────────────────────────────────────────
+    keywords = []
+
+    # Topic titles (text before colon = punchy label)
+    for t in topics:
+        label = t.get('topic', '').split(':')[0].strip()
+        if label:
+            keywords.append(label)
+
+    # Topic descriptions — extract 2-3 word noun phrases
+    for t in topics:
+        desc = t.get('description', '')
+        if desc:
+            # grab capitalised multi-word phrases as bonus keywords
+            phrases = _re.findall(r'[A-Z][a-z]+(?: [a-z]+){1,3}', desc)
+            keywords.extend(phrases[:2])
+
+    # Discussion points
+    keywords.extend(discussion_points[:6])
+
+    # Derive extra signals from bio (capitalised phrases = strong nouns)
+    if bio:
+        bio_phrases = _re.findall(r'[A-Z][a-z]+(?: [a-z]+){1,2}', bio)
+        keywords.extend(bio_phrases[:4])
+
+    # Title-derived keywords (e.g. "Emergency Medicine Physician" → "Emergency Medicine")
+    if title:
+        title_parts = [p.strip() for p in title.split(',')]
+        keywords.extend(title_parts[:2])
+
+    # Industries fallback
     if not industries:
         industries = ['professional']
 
-    # Build keyword pool from topics + discussion points
-    keywords = []
-    for t in topics:
-        # Extract key phrase from topic title
-        keywords.append(t.split(':')[0].strip())
-    keywords.extend(discussion_points[:5])
-
-    # Ensure keywords is never empty
+    # Keywords fallback
     if not keywords:
         keywords = [name or 'speaker']
 
+    # Deduplicate keywords preserving order, drop empties
+    seen_kw: set = set()
+    keywords = [k for k in keywords if k and not (k in seen_kw or seen_kw.add(k))]  # type: ignore[func-returns-value]
+
+    # ── Tier scope word ───────────────────────────────────────
+    tier_scope = ''
+    if conference_tier in ('national', 'large'):
+        tier_scope = 'national'
+    elif conference_tier in ('regional', 'medium'):
+        tier_scope = 'regional'
+
     queries = []
-    # Use conference_year from profile if set, otherwise fall back to current year
-    year = str(profile.get('conference_year') or __import__('datetime').date.today().year)
 
-    # 1. Conferences (Traditional)
-    for i in range(3):
-        kw = keywords[i % len(keywords)]
+    # 1. Conferences — call for speakers (vary keywords + industries)
+    for i in range(min(4, len(keywords))):
+        kw = keywords[i]
         ind = industries[i % len(industries)]
-        queries.append(f'{kw} {ind} "call for speakers" conference {year}')
+        scope = f' {tier_scope}' if tier_scope else ''
+        queries.append(f'{kw} {ind}{scope} "call for speakers" conference {year}')
 
-    # 2. Podcasts (New)
-    # "guest host", "looking for guests", "interview"
-    for i in range(3):
-        kw = keywords[(i + 1) % len(keywords)]
-        queries.append(f'{kw} podcast "looking for guests"')
-        queries.append(f'{kw} podcast "guest application"')
-        queries.append(f'top {kw} podcasts interview guest')
+    # 2. Conferences — call for proposals / abstracts
+    for i in range(min(3, len(keywords))):
+        kw = keywords[i]
+        ind = industries[i % len(industries)]
+        queries.append(f'{kw} {ind} "call for proposals" {year}')
 
-    # 3. Corporate / Associations (New)
-    for i in range(3):
-        kw = keywords[(i + 2) % len(keywords)]
-        ind = industries[(i + 2) % len(industries)]
-        queries.append(f'{ind} association "call for presenters" {kw}')
-        queries.append(f'{kw} corporate "lunch and learn" speaker')
-        queries.append(f'{ind} corporate event {kw} speaker')
-
-    # 4. Local / Geotargeted (New)
-    for i in range(3):
-        kw = keywords[(i + 3) % len(keywords)]
-        queries.append(f'{kw} speaker {geo} event {year}')
-        queries.append(f'{kw} meetup {geo} "looking for speakers"')
-        queries.append(f'local chapter {geo} {kw} speaker')
-
-    # 5. General Keynote
-    for i in range(2):
-        kw = keywords[(i + 4) % len(keywords)]
-        ind = industries[(i + 4) % len(industries)]
+    # 3. Keynote angle
+    for i in range(min(3, len(keywords))):
+        kw = keywords[i]
+        ind = industries[i % len(industries)]
         queries.append(f'{kw} "keynote speaker" {ind} {year}')
 
-    # Speaker name specific
+    # 4. Title / credential angle — targets conferences that search by expertise
+    if title:
+        primary_title = title.split(',')[0].strip()
+        queries.append(f'"{primary_title}" "call for speakers" {year}')
+        queries.append(f'{primary_title} conference speaker {year}')
+    if credentials:
+        queries.append(f'{credentials} conference "call for speakers" {year}')
+
+    # 5. Book / author angle
+    if book_title:
+        queries.append(f'"{book_title}" author speaker conference')
+        queries.append(f'author speaker "{book_title}" interview podcast')
+
+    # 6. Podcasts
+    for i in range(min(3, len(keywords))):
+        kw = keywords[i]
+        queries.append(f'{kw} podcast "looking for guests"')
+    for i in range(min(2, len(keywords))):
+        kw = keywords[i]
+        queries.append(f'top {kw} podcasts interview guest expert')
+
+    # 7. Corporate / associations
+    for i in range(min(3, len(keywords))):
+        kw = keywords[i]
+        ind = industries[i % len(industries)]
+        queries.append(f'{ind} association annual meeting "call for presenters" {kw}')
+        queries.append(f'{kw} corporate event speaker {ind}')
+
+    # 8. Geo-targeted (only if not national-only tier)
+    if conference_tier not in ('national', 'large'):
+        for i in range(min(2, len(keywords))):
+            kw = keywords[i]
+            queries.append(f'{kw} speaker {geo} event {year}')
+            queries.append(f'{kw} meetup {geo} "looking for speakers"')
+        if zip_code:
+            for i in range(min(2, len(keywords))):
+                kw = keywords[i]
+                queries.append(f'{kw} speaker near {zip_code} event {year}')
+                queries.append(f'{kw} conference near {zip_code} "call for speakers"')
+
+    # 9. Speaker name — reputation / inbound signal
     if name:
-        queries.append(f'"{name}" events "looking for speakers"')
+        queries.append(f'"{name}" speaker conference {year}')
 
     # Deduplicate preserving order
-    seen = set()
+    seen: set = set()
     deduped = []
     for q in queries:
         if q not in seen:
             seen.add(q)
             deduped.append(q)
 
-    return deduped[:10]
+    return deduped[:25]
 
 
 def web_search(queries: list[str],
