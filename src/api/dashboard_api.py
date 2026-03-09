@@ -1235,6 +1235,44 @@ Return JSON only, no markdown, no extra text."""
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── Speaker contents upload ──────────────────────────────────
+
+class SpeakerContentsUploadRequest(BaseModel):
+    files: List[EmailAttachment]
+
+
+@app.post("/api/speaker/{speaker_id}/contents")
+def upload_speaker_contents(speaker_id: str, body: SpeakerContentsUploadRequest, _: None = Depends(verify_api_key)):
+    """Upload one or more files to the Contents field of a speaker's Airtable record."""
+    if not body.files:
+        raise HTTPException(status_code=400, detail="No files provided")
+
+    at = get_airtable()
+    record = at.get_speaker(speaker_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Speaker not found")
+
+    record_id = record['id']
+    field_name = os.getenv('AIRTABLE_CONTENTS_FIELD', 'Contents')
+
+    def _upload(rid: str, files, fname: str):
+        _at = get_airtable()
+        for f in files:
+            try:
+                _at.upload_attachment(rid, fname, f.filename, f.content, f.type or 'application/octet-stream')
+                logger.info(f"[CONTENTS] Uploaded '{f.filename}' for {speaker_id}")
+            except Exception as e:
+                logger.error(f"[CONTENTS] Failed to upload '{f.filename}' for {speaker_id}: {e}")
+
+    threading.Thread(
+        target=_upload,
+        args=(record_id, body.files, field_name),
+        daemon=True,
+    ).start()
+
+    return {"status": "uploading", "speaker_id": speaker_id, "files": [f.filename for f in body.files]}
+
+
 @app.put("/api/speaker/{speaker_id}/plan")
 def update_speaker_plan(speaker_id: str, _: None = Depends(verify_api_key), tier: str = Query(...)):
     """Update a speaker's plan tier. Resets scouts_used and scouts_reset_date."""
