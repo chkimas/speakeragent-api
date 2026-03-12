@@ -981,13 +981,15 @@ def _fetch_trending_topics(industries: list, credentials: str) -> str:
     """Search for trending conference topics via SerpAPI or Serper. Returns a formatted context string."""
     industry_str = industries[0] if industries else credentials or 'professional development'
     queries = [
-        f'trending conference keynote topics 2026 {industry_str}',
-        f'most popular speaker topics {industry_str} conferences 2026',
+        f'trending conference keynote topics {date.today().year} {industry_str}',
+        f'most popular speaker topics {industry_str} conferences {date.today().year}',
     ]
 
     snippets = _fetch_trending_topics_serpapi(queries)
     if not snippets:
         snippets = _fetch_trending_topics_serper(queries)
+    if not snippets:
+        snippets = _fetch_trending_topics_tavily(queries)
 
     if not snippets:
         return ''
@@ -1005,13 +1007,13 @@ def _fetch_trending_topics_serpapi(queries: list) -> list:
         try:
             resp = http_requests.get(
                 'https://serpapi.com/search.json',
-                params={'q': query, 'api_key': serp_key, 'num': 5, 'hl': 'en', 'gl': 'us'},
+                params={'q': query, 'api_key': serp_key, 'num': 10, 'hl': 'en', 'gl': 'us'},
                 timeout=8,
             )
             if resp.status_code != 200:
                 logger.warning(f"[TOPICS] SerpAPI {resp.status_code} for: {query}")
                 continue
-            for r in resp.json().get('organic_results', [])[:5]:
+            for r in resp.json().get('organic_results', [])[:10]:
                 title = r.get('title', '')
                 snippet = r.get('snippet', '')
                 if title or snippet:
@@ -1036,13 +1038,13 @@ def _fetch_trending_topics_serper(queries: list) -> list:
             resp = http_requests.post(
                 'https://google.serper.dev/search',
                 headers={'X-API-KEY': serper_key, 'Content-Type': 'application/json'},
-                json={'q': query, 'num': 5, 'gl': 'us', 'hl': 'en'},
+                json={'q': query, 'num': 10, 'gl': 'us', 'hl': 'en'},
                 timeout=8,
             )
             if resp.status_code != 200:
                 logger.warning(f"[TOPICS] Serper {resp.status_code} for: {query}")
                 continue
-            for r in resp.json().get('organic', [])[:5]:
+            for r in resp.json().get('organic', [])[:10]:
                 title = r.get('title', '')
                 snippet = r.get('snippet', '')
                 if title or snippet:
@@ -1055,25 +1057,73 @@ def _fetch_trending_topics_serper(queries: list) -> list:
     return snippets
 
 
-@app.get("/api/topics")
-def suggest_topics(speaker_id: str = Query(...), _: None = Depends(verify_api_key)):
+def _fetch_trending_topics_tavily(queries: list) -> list:
+    """Fetch trending topic snippets via Tavily. Returns list of formatted strings."""
+    tavily_key = os.getenv('TAVILY_API_KEY', '')
+    if not tavily_key:
+        return []
+
+    snippets = []
+    for query in queries:
+        try:
+            resp = http_requests.post(
+                'https://api.tavily.com/search',
+                headers={'Content-Type': 'application/json'},
+                json={'api_key': tavily_key, 'query': query, 'max_results': 10, 'search_depth': 'basic'},
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[TOPICS] Tavily {resp.status_code} for: {query}")
+                continue
+            for r in resp.json().get('results', [])[:5]:
+                title = r.get('title', '')
+                content = r.get('content', '')
+                if title or content:
+                    snippets.append(f"- {title}: {content[:200]}")
+        except Exception as e:
+            logger.warning(f"[TOPICS] Tavily failed for '{query}': {e}")
+
+    if snippets:
+        logger.info(f"[TOPICS] Tavily returned {len(snippets)} snippets")
+    return snippets
+
+
+class TopicSuggestionsRequest(BaseModel):
+    persona_id: Optional[str] = None
+    personaBio: Optional[str] = None
+    personaCredentials: Optional[str] = None
+    personaGritFactor: Optional[str] = None
+    topics: Optional[List[SpeakerTopic]] = None
+
+
+@app.post("/api/topics")
+def suggest_topics(
+    body: TopicSuggestionsRequest,
+    speaker_id: str = Query(...),
+    _: None = Depends(verify_api_key),
+):
     """Generate AI-powered topic suggestions grounded in real-time web trends via SerpAPI."""
     at = get_airtable()
-    record = at.get_speaker(speaker_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="Speaker not found")
 
-    fields = record.get('fields', {})
+    fields = {}
+    if body.persona_id:
+        record = at.get_persona_by_id(body.persona_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="Persona not found")
+        fields = record.get('fields', {})
 
-    # Parse existing topics
+    # Parse existing topics — prefer body.topics when no persona_id
     existing_topics = []
-    raw_topics = fields.get('topics', '')
-    if raw_topics:
-        try:
-            topic_list = json.loads(raw_topics) if isinstance(raw_topics, str) else raw_topics
-            existing_topics = [t.get('title', '') for t in topic_list if isinstance(t, dict)]
-        except (json.JSONDecodeError, TypeError):
-            pass
+    if body.persona_id:
+        raw_topics = fields.get('topics', '')
+        if raw_topics:
+            try:
+                topic_list = json.loads(raw_topics) if isinstance(raw_topics, str) else raw_topics
+                existing_topics = [t.get('title', '') for t in topic_list if isinstance(t, dict)]
+            except (json.JSONDecodeError, TypeError):
+                pass
+    elif body.topics:
+        existing_topics = [t.title for t in body.topics]
 
     # Parse target industries
     industries = []
@@ -1084,13 +1134,15 @@ def suggest_topics(speaker_id: str = Query(...), _: None = Depends(verify_api_ke
         except (json.JSONDecodeError, TypeError):
             pass
 
-    full_name = fields.get('full_name', 'the speaker')
-    tagline = fields.get('tagline', '')
-    credentials = fields.get('credentials', '')
-    bio = (fields.get('bio', '') or '')[:600]
-    years_exp = fields.get('years_experience', '')
+    
+    tagline = body.personaGritFactor or fields.get('tagline', '')
+    credentials = body.personaCredentials or fields.get('credentials', '')
+    bio = ((body.personaBio or fields.get('bio', '') or ''))[:600]
+    # years_exp = fields.get('years_experience', '')
     existing_str = ', '.join(existing_topics) if existing_topics else 'None provided'
     industries_str = ', '.join(industries) if industries else 'General'
+
+    logger.info(f"[TOPICS] Generating topics for {speaker_id} with tagline='{tagline}', credentials='{credentials}', industries='{industries_str}', existing_topics='{existing_str}'")
 
     # Fetch live trending data from SerpAPI
     serp_context = _fetch_trending_topics(industries, credentials)
@@ -1099,10 +1151,8 @@ def suggest_topics(speaker_id: str = Query(...), _: None = Depends(verify_api_ke
     prompt = f"""You are a speaking industry expert helping identify high-demand conference topics.
 
 SPEAKER PROFILE:
-- Name: {full_name}
 - Title: {tagline}
 - Credentials: {credentials}
-- Years of Experience: {years_exp}
 - Target Industries: {industries_str}
 - Bio: {bio}
 - Existing Topics: {existing_str}
@@ -1145,7 +1195,10 @@ Return JSON only, no markdown, no extra text."""
             logger.error(f"[TOPICS] No JSON array in Claude response: {text[:1000]}")
             raise json.JSONDecodeError("No JSON array found in response", text, 0)
         topics = json.loads(text[start:end + 1])
-        return {"speaker_id": speaker_id, "topics": topics, "web_grounded": bool(serp_context)}
+        result = {"speaker_id": speaker_id, "topics": topics, "web_grounded": bool(serp_context)}
+        if body.persona_id:
+            result["persona_id"] = body.persona_id
+        return result
     except json.JSONDecodeError as e:
         logger.error(f"[TOPICS] Failed to parse Claude response for {speaker_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to parse AI response")
