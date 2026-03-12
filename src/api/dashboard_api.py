@@ -17,7 +17,6 @@ from typing import List, Optional
 
 import requests as http_requests
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.security import APIKeyHeader
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -26,6 +25,8 @@ from pydantic import BaseModel
 from config.settings import Settings
 from src.api.airtable import AirtableAPI
 from src.api.checklist_api import router as checklist_router
+from src.api.persona_api import router as persona_router, _body_to_fields as _persona_fields_from_body
+from src.api.deps import verify_api_key, TIER_MAX_PERSONAS
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +47,6 @@ def _configure_logging():
 
 VALID_LEAD_STATUSES = {'New', 'Contacted', 'Replied', 'Booked', 'Passed', 'Rejected'}
 
-_api_key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
-
-def verify_api_key(key: Optional[str] = Depends(_api_key_header)):
-    """Require a valid X-API-Key header on protected endpoints."""
-    expected = os.getenv('API_KEY', '')  # read at request time — avoids Railway startup ordering issues
-    if not expected:
-        raise HTTPException(status_code=503, detail="API_KEY not configured")
-    if key != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-
 
 # ── Scheduler ───────────────────────────────────────────────
 
@@ -64,6 +55,8 @@ def _ensure_profile_exists(speaker_id: str, profile_path: str) -> str:
 
     Returns the (possibly updated) profile_path.
     """
+    from src.api.profile_utils import build_profile_from_fields
+
     p = Path(profile_path)
     if p.exists():
         return profile_path
@@ -71,65 +64,20 @@ def _ensure_profile_exists(speaker_id: str, profile_path: str) -> str:
     logger.info(f"[SCOUT] Profile file missing: {profile_path}. Rebuilding from Airtable...")
     try:
         at = get_airtable()
-        record = at.get_speaker(speaker_id)
-        if not record:
+        persona = at.get_persona(speaker_id)
+        speaker = at.get_speaker(speaker_id)
+        if not persona and not speaker:
             logger.warning(f"[SCOUT] Speaker {speaker_id} not found in Airtable either!")
-            return profile_path  # Will fail in run_scout, but at least we tried
+            return profile_path
 
-        fields = record.get('fields', {})
+        fields = {**(speaker.get('fields', {}) if speaker else {}),
+                  **(persona.get('fields', {}) if persona else {})}
 
-        # Parse topics from JSON string stored in Airtable
-        topics = []
-        raw_topics = fields.get('topics', '')
-        if raw_topics:
-            try:
-                topic_list = json.loads(raw_topics) if isinstance(raw_topics, str) else raw_topics
-                for t in topic_list:
-                    if isinstance(t, dict):
-                        topics.append({
-                            'topic': t.get('title', ''),
-                            'description': t.get('abstract', ''),
-                            'audience': t.get('audience', '')
-                        })
-                    else:
-                        topics.append({'topic': t, 'description': ''})
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        # Parse target_industries
-        industries = []
-        raw_ind = fields.get('target_industries', '')
-        if raw_ind:
-            try:
-                industries = json.loads(raw_ind) if isinstance(raw_ind, str) else raw_ind
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        profile = {
-            'full_name': fields.get('full_name', speaker_id),
-            'credentials': fields.get('credentials', ''),
-            'professional_title': fields.get('tagline', ''),
-            'years_experience': fields.get('years_experience', 0),
-            'book_title': '',
-            'topics': topics if topics else [{'topic': 'General', 'description': ''}],
-            'target_industries': industries,
-            'target_geography': fields.get('location', 'National (US)'),
-            'min_honorarium': fields.get('min_honorarium', 0),
-            'discussion_points': [t['topic'] for t in topics][:10],
-            'linkedin': fields.get('linkedin', ''),
-            'website': fields.get('website', ''),
-            'speaker_sheet': fields.get('speaker_sheet', ''),
-            'notes': fields.get('notes', ''),
-            'conference_year': fields.get('conference_year', date.today().year),
-            'conference_tier': fields.get('conference_tier', ''),
-        }
-        if fields.get('bio'):
-            profile['bio'] = fields['bio']
-
+        profile = build_profile_from_fields(fields)
         p.parent.mkdir(parents=True, exist_ok=True)
         with open(p, 'w') as f:
             json.dump(profile, f, indent=2)
-        logger.info(f"[SCOUT] Rebuilt profile for {speaker_id} from Airtable data")
+        logger.info(f"[SCOUT] Rebuilt profile for {speaker_id} → {profile_path}")
 
     except Exception as e:
         logger.error(f"[SCOUT] Failed to rebuild profile for {speaker_id}: {e}")
@@ -151,12 +99,6 @@ _TIER_MAX_LEADS = {
     'Pro': 9999,
 }
 
-# Max speaker personas (profiles) per account email per tier
-_TIER_MAX_PERSONAS = {
-    'Free': 1,
-    'Starter': 1,
-    'Pro': 3,
-}
 
 
 def _check_and_reset_plan(speaker_id: str) -> Optional[tuple]:
@@ -210,8 +152,12 @@ def _check_and_reset_plan(speaker_id: str) -> Optional[tuple]:
         return None
 
 
-def _run_scout_for_speaker(speaker_id: str, profile_path: str):
-    """Run scout pipeline for a single speaker."""
+def _run_scout_for_speaker(speaker_id: str, profile_path: str, persona_record_id: str = ''):
+    """Run scout pipeline for a single speaker/persona.
+
+    persona_record_id: Airtable record ID of the Speaker_Persona row to update
+    scout_status on. If omitted, falls back to the first persona for the speaker.
+    """
     try:
         from src.agent.scout import run_scout
         # Ensure profile exists (rebuild from Airtable if container was redeployed)
@@ -225,16 +171,25 @@ def _run_scout_for_speaker(speaker_id: str, profile_path: str):
         record, _, scouts_used, max_leads_per_run = plan
 
         at = get_airtable()
-        at.update_speaker(record['id'], {'scout_status': 'Running'})
+        # Resolve which persona row to stamp scout_status on
+        if persona_record_id:
+            persona = at.get_persona_by_id(persona_record_id)
+        else:
+            persona = at.get_persona(speaker_id)
+        if persona:
+            at.update_persona(persona['id'], {'scout_status': 'Running'})
         logger.info(f"[SCOUT] Starting scout for {speaker_id} with profile {profile_path}")
         try:
             summary = run_scout(
                 profile_path=profile_path,
                 speaker_id=speaker_id,
                 max_leads=max_leads_per_run,
+                persona_record_id=persona_record_id,
             )
         finally:
-            at.update_speaker(record['id'], {'scout_status': 'Completed'})
+            if persona:
+                logger.info(f"[SCOUT] Marking scout as Completed for {speaker_id} persona {persona_record_id}")
+                at.update_persona(persona['id'], {'scout_status': 'Completed'})
 
         logger.info(
             f"[SCOUT] Complete for {speaker_id}: "
@@ -270,8 +225,9 @@ def _run_daily_scout():
             base_id=settings.AIRTABLE_BASE_ID,
             leads_table=settings.LEADS_TABLE,
             speakers_table=settings.SPEAKERS_TABLE,
+            persona_table=settings.PERSONA_TABLE,
         )
-        active_speakers = at.list_active_speakers()
+        active_speakers = at.list_active_personas()
         if not active_speakers:
             logger.warning("[CRON] No active speakers found. Falling back to default.")
             _run_scout_for_speaker(
@@ -284,11 +240,11 @@ def _run_daily_scout():
         for record in active_speakers:
             fields = record.get('fields', {})
             sid = fields.get('speaker_id', '')
+            persona_record_id = record.get('id', '')
             if not sid:
                 continue
-            # Use stored profile or fall back to default seed path
-            profile_path = f"config/speaker_profiles/{sid}.json"
-            _run_scout_for_speaker(sid, profile_path)
+            profile_path = f"config/speaker_profiles/{sid}_{persona_record_id}.json"
+            _run_scout_for_speaker(sid, profile_path, persona_record_id)
 
     except Exception as e:
         logger.error(f"[CRON] Daily scout failed: {e}", exc_info=True)
@@ -331,6 +287,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(checklist_router)
+app.include_router(persona_router)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
@@ -366,6 +323,7 @@ def get_airtable() -> AirtableAPI:
             base_id=_settings.AIRTABLE_BASE_ID,
             leads_table=_settings.LEADS_TABLE,
             speakers_table=_settings.SPEAKERS_TABLE,
+            persona_table=_settings.PERSONA_TABLE,
         )
     return _airtable
 
@@ -435,6 +393,7 @@ class SpeakerRegistration(BaseModel):
     conference_tier: Optional[str] = None
     zip_code: Optional[str] = None
     attachments: Optional[List[EmailAttachment]] = None
+    # persona_name: Optional[str] = None
 
 
 # ── Health ──────────────────────────────────────────────────
@@ -622,8 +581,17 @@ def trigger_directory_build(
 # ── Scout (manual trigger) ─────────────────────────────────
 
 @app.post("/api/scout/run")
-def trigger_scout(speaker_id: Optional[str] = Query(None), _: None = Depends(verify_api_key)):
-    """Manually trigger a scout run. Optionally for a specific speaker."""
+def trigger_scout(
+    speaker_id: Optional[str] = Query(None),
+    persona_id: Optional[str] = Query(None),
+    _: None = Depends(verify_api_key),
+):
+    """Manually trigger a scout run.
+
+    - No params: runs scout for all active speakers.
+    - speaker_id only: runs for the speaker's default (first) persona.
+    - speaker_id + persona_id: runs for that specific persona.
+    """
     if speaker_id:
         plan_info = _check_and_reset_plan(speaker_id)
         if plan_info is None:
@@ -635,14 +603,31 @@ def trigger_scout(speaker_id: Optional[str] = Query(None), _: None = Depends(ver
                 status_code=429,
                 detail=f"Scout quota exhausted ({scouts_used}/{max_scout_runs} runs used). Resets weekly.",
             )
-        profile_path = f"config/speaker_profiles/{speaker_id}.json"
+
+        # Resolve profile path: per-persona file if persona_id provided, else default
+        if persona_id:
+            at = get_airtable()
+            persona = at.get_persona_by_id(persona_id)
+            if not persona:
+                raise HTTPException(status_code=404, detail="Persona not found")
+            if persona.get('fields', {}).get('speaker_id') != speaker_id:
+                raise HTTPException(status_code=403, detail="Persona does not belong to this speaker")
+            profile_path = f"config/speaker_profiles/{speaker_id}_{persona_id}.json"
+        else:
+            profile_path = f"config/speaker_profiles/{speaker_id}.json"
+
         thread = threading.Thread(
             target=_run_scout_for_speaker,
-            args=(speaker_id, profile_path),
+            args=(speaker_id, profile_path, persona_id or ''),
             daemon=True,
         )
         thread.start()
-        return {"status": "started", "speaker_id": speaker_id, "scouts_remaining": remaining - 1}
+        return {
+            "status": "started",
+            "speaker_id": speaker_id,
+            "persona_id": persona_id,
+            "scouts_remaining": remaining - 1,
+        }
     else:
         thread = threading.Thread(target=_run_daily_scout, daemon=True)
         thread.start()
@@ -651,13 +636,40 @@ def trigger_scout(speaker_id: Optional[str] = Query(None), _: None = Depends(ver
 
 @app.get("/api/scout/status/{speaker_id}")
 def get_scout_status(speaker_id: str, _: None = Depends(verify_api_key)):
-    """Return the current scout_status for a speaker."""
+    """Return the current scout_status for a speaker (from Speaker_Persona)."""
     at = get_airtable()
-    speaker = at.get_speaker(speaker_id)
-    if not speaker:
+    persona = at.get_persona(speaker_id)
+    if not persona:
         raise HTTPException(status_code=404, detail="Speaker not found")
-    status = speaker.get("fields", {}).get("scout_status", None)
+    status = persona.get("fields", {}).get("scout_status", None)
     return {"speaker_id": speaker_id, "scout_status": status}
+
+
+@app.get("/api/speakers/by-email/{email}")
+def get_personas_by_email(email: str, _: None = Depends(verify_api_key)):
+    """Return all personas for a given email (joins Speakers + Speaker_Persona)."""
+    at = get_airtable()
+    speaker_records = at.list_speakers_by_email(email)
+    if not speaker_records:
+        return {"email": email, "personas": [], "count": 0}
+    personas = []
+    for r in speaker_records:
+        sf = r["fields"]
+        sid = sf.get("speaker_id", "")
+        persona = at.get_persona(sid) if sid else None
+        pf = persona.get("fields", {}) if persona else {}
+        personas.append({
+            "speaker_id": sid,
+            "full_name": sf.get("full_name"),
+            # "persona_name": pf.get("persona_name") or sf.get("full_name"),
+            "plan": sf.get("Plan", "Free"),
+            "scouts_used": sf.get("scouts_used", 0),
+            "status": pf.get("status"),
+            "scout_status": pf.get("scout_status"),
+            "created_at": pf.get("created_at"),
+            "topics": pf.get("topics"),
+        })
+    return {"email": email, "personas": personas, "count": len(personas)}
 
 
 # ── Email ──────────────────────────────────────────────────
@@ -817,59 +829,15 @@ Return JSON only, no markdown, no extra text."""
         return profile
 
 
-def _create_profile_and_run_scout(speaker_id: str, body):
+def _create_profile_and_run_scout(speaker_id: str, body, persona_record_id: str = ''):
     """Create a speaker profile JSON from registration data and trigger scout."""
-    try:
-        # Build profile dict matching the format expected by scout pipeline
-        topics = []
-        if body.topics:
-            for t in body.topics:
-                topics.append({'topic': t.title, 'description': t.abstract or ''})
-
-        profile = {
-            'full_name': body.full_name,
-            'credentials': body.credentials or '',
-            'professional_title': body.tagline or '',
-            'years_experience': body.years_experience or 0,
-            'book_title': '',
-            'topics': topics if topics else [{'topic': 'General', 'description': ''}],
-            'target_industries': body.target_industries or [],
-            'target_geography': body.location or 'National (US)',
-            'min_honorarium': body.min_honorarium or 0,
-        }
-
-        # Build discussion_points from topic title strings for better search queries
-        discussion_points = []
-        topic_objects = body.topics or []
-        for t_obj in topic_objects:
-            t_str = t_obj.title
-            discussion_points.append(t_str)
-            phrase = t_str.split(':')[0].strip()
-            if phrase != t_str:
-                discussion_points.append(phrase)
-        profile['discussion_points'] = discussion_points[:10]
-
-        # Store full bio for context
-        if body.bio:
-            profile['bio'] = body.bio
-
-        # Clean and normalize free-text fields before saving
-        profile = _clean_profile_with_ai(profile)
-
-        logger.info(f"[SCOUT] Profile created for {speaker_id}, cleaned with AI, now saving and running scout")
-
-        # Save profile JSON
-        profile_dir = Path('config/speaker_profiles')
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        profile_path = profile_dir / f'{speaker_id}.json'
-        with open(profile_path, 'w') as f:
-            json.dump(profile, f, indent=2)
-
-        logger.info(f"[SCOUT] Profile created for {speaker_id}, triggering scout run")
-        _run_scout_for_speaker(speaker_id, str(profile_path))
-
-    except Exception as e:
-        logger.error(f"[SCOUT] Failed to create profile / run scout for {speaker_id}: {e}", exc_info=True)
+    from src.api.profile_utils import create_profile_and_run_scout
+    create_profile_and_run_scout(
+        speaker_id,
+        persona_record_id,
+        body=body,
+        profile_cleaner=_clean_profile_with_ai,
+    )
 
 
 # ── Speaker ─────────────────────────────────────────────────
@@ -883,7 +851,7 @@ def register_speaker(body: SpeakerRegistration):
     existing_personas = at.list_speakers_by_email(body.email)
     if existing_personas:
         plan = (existing_personas[0].get('fields', {}).get('Plan') or 'Free').strip()
-        max_personas = _TIER_MAX_PERSONAS.get(plan, 1)
+        max_personas = TIER_MAX_PERSONAS.get(plan, 1)
         if len(existing_personas) >= max_personas:
             raise HTTPException(
                 status_code=403,
@@ -901,51 +869,29 @@ def register_speaker(body: SpeakerRegistration):
     short_uuid = uuid.uuid4().hex[:8]
     speaker_id = f"{name_slug}_{short_uuid}"
 
-    # Build speaker record
-    fields = {
+    # Create Speakers row — identity + billing only
+    speaker_fields = {
         'speaker_id': speaker_id,
         'full_name': body.full_name,
         'email': body.email,
-        'status': 'active',
-        'Plan': 'Free',
+        'Plan': 'Pro',
         'scouts_used': 0,
         'scouts_reset_date': date.today().isoformat(),
-        'created_at': date.today().isoformat(),
     }
-    if body.tagline:
-        fields['tagline'] = body.tagline
-    if body.bio:
-        fields['bio'] = body.bio
-    if body.topics:
-        fields['topics'] = json.dumps([t.model_dump() for t in body.topics])
-    if body.target_industries:
-        fields['target_industries'] = json.dumps(body.target_industries)
-    if body.min_honorarium is not None:
-        fields['min_honorarium'] = body.min_honorarium
-    if body.years_experience is not None:
-        fields['years_experience'] = body.years_experience
-    if body.location:
-        fields['location'] = body.location
-    if body.website:
-        fields['website'] = body.website
-    if body.credentials:
-        fields['credentials'] = body.credentials
-    if body.linkedin:
-        fields['linkedin'] = body.linkedin
-    if body.speaker_sheet:
-        fields['speaker_sheet'] = body.speaker_sheet
-    if body.notes:
-        fields['notes'] = body.notes
-    if body.conference_year is not None:
-        fields['conference_year'] = body.conference_year
-    if body.conference_tier:
-        fields['conference_tier'] = body.conference_tier
-    if body.zip_code:
-        fields['zip_code'] = body.zip_code
-
-    record = at.create_speaker(fields)
+    record = at.create_speaker(speaker_fields)
     if not record:
         raise HTTPException(status_code=500, detail="Failed to create speaker")
+
+    # Create Speaker_Persona row — profile details
+    persona_fields = _persona_fields_from_body(body)
+    persona_fields['speaker_id'] = speaker_id
+    persona_fields['created_at'] = date.today().isoformat()
+    # persona_fields.setdefault('status', 'active')
+    persona_record = at.create_persona(persona_fields)
+    if not persona_record:
+        # Roll back the Speakers row so data stays consistent
+        at.delete_speaker(record['id'])
+        raise HTTPException(status_code=500, detail="Failed to create Persona")
 
     # Create onboarding checklist (non-blocking)
     threading.Thread(
@@ -953,8 +899,8 @@ def register_speaker(body: SpeakerRegistration):
         daemon=True,
     ).start()
 
-    # Upload attachments to Airtable (non-blocking)
-    if body.attachments:
+    # Upload attachments to Speaker_Persona row (non-blocking)
+    if body.attachments and persona_record:
         def _upload_attachments(record_id: str, attachments):
             field_name = os.getenv('AIRTABLE_ATTACHMENT_FIELD', 'Attachments')
             _at = get_airtable()
@@ -965,7 +911,7 @@ def register_speaker(body: SpeakerRegistration):
                     logger.error(f"Failed to upload attachment '{attachment.filename}': {e}")
         threading.Thread(
             target=_upload_attachments,
-            args=(record["id"], body.attachments),
+            args=(persona_record["id"], body.attachments),
             daemon=True,
         ).start()
 
@@ -976,12 +922,14 @@ def register_speaker(body: SpeakerRegistration):
         daemon=True,
     ).start()
 
-    # Trigger first scout run immediately (non-blocking)
-    threading.Thread(
-        target=_create_profile_and_run_scout,
-        args=(speaker_id, body),
-        daemon=True,
-    ).start()
+    # Create profile JSON and trigger first scout run (non-blocking)
+    if persona_record:
+        persona_record_id = persona_record['id']
+        threading.Thread(
+            target=_create_profile_and_run_scout,
+            args=(speaker_id, body, persona_record_id),
+            daemon=True,
+        ).start()
 
     return {
         "speaker_id": speaker_id,
@@ -992,14 +940,16 @@ def register_speaker(body: SpeakerRegistration):
 
 @app.get("/api/speaker/{speaker_id}")
 def get_speaker(speaker_id: str, _: None = Depends(verify_api_key)):
-    """Get speaker profile from Airtable."""
+    """Get speaker profile from Airtable (merges Speakers + Speaker_Persona)."""
     logger.info(f"Fetching speaker {speaker_id} from Airtable")
     at = get_airtable()
     record = at.get_speaker(speaker_id)
     if not record:
         raise HTTPException(status_code=404, detail="Speaker not found")
-    fields = record.get("fields", {})
-    result = {"id": record["id"], **fields}
+    persona = at.get_persona(speaker_id)
+    # Merge: persona fields override speaker fields (persona holds the profile details)
+    fields = {**record.get("fields", {}), **(persona.get("fields", {}) if persona else {})}
+    result = {"id": record["id"], "persona_id": persona["id"] if persona else None, **fields}
 
     # If speaker has a tier, include plan limits and current scouts used
     tier = (fields.get('Plan') or '').strip()
@@ -1341,137 +1291,121 @@ def update_speaker_plan(speaker_id: str, _: None = Depends(verify_api_key), tier
 
 @app.put("/api/speaker/{speaker_id}")
 def update_speaker(speaker_id: str, body: SpeakerUpdate, _: None = Depends(verify_api_key)):
+    """Update speaker profile. Identity fields → Speakers, profile fields → Speaker_Persona."""
     logger.info(f"Received update for speaker {speaker_id}")
-    """Update speaker profile. Only non-None fields are changed."""
     at = get_airtable()
     record = at.get_speaker(speaker_id)
     if not record:
         raise HTTPException(status_code=404, detail="Speaker not found")
 
-    # logger.info(f"request body: {body}")
-    logger.info(f"Updating speaker {speaker_id} with data: {record}")
     record_id = record["id"]
-    fields = {}
 
+    # Identity fields → Speakers table
+    speaker_fields = {}
     if body.full_name is not None:
-        fields['full_name'] = body.full_name
+        speaker_fields['full_name'] = body.full_name
     if body.email is not None:
-        fields['email'] = body.email
-    if body.tagline is not None:
-        fields['tagline'] = body.tagline
-    if body.bio is not None:
-        fields['bio'] = body.bio
-    if body.topics is not None:
-        fields['topics'] = json.dumps([t.model_dump() for t in body.topics])
-    if body.target_industries is not None:
-        fields['target_industries'] = json.dumps(body.target_industries)
-    if body.min_honorarium is not None:
-        fields['min_honorarium'] = body.min_honorarium
-    if body.years_experience is not None:
-        fields['years_experience'] = body.years_experience
-    if body.location is not None:
-        fields['location'] = body.location
-    if body.website is not None:
-        fields['website'] = body.website
-    if body.credentials is not None:
-        fields['credentials'] = body.credentials
-    if body.linkedin is not None:
-        fields['linkedin'] = body.linkedin
-    if body.speaker_sheet is not None:
-        fields['speaker_sheet'] = body.speaker_sheet
-    if body.notes is not None:
-        fields['notes'] = body.notes
-    if body.conference_year is not None:
-        fields['conference_year'] = body.conference_year
-    if body.conference_tier is not None:
-        fields['conference_tier'] = body.conference_tier
-    if body.zip_code is not None:
-        fields['zip_code'] = body.zip_code
+        speaker_fields['email'] = body.email
 
-    if not fields and not body.attachments:
+    # Profile fields → Speaker_Persona table
+    persona_fields = {}
+    if body.tagline is not None:
+        persona_fields['tagline'] = body.tagline
+    if body.bio is not None:
+        persona_fields['bio'] = body.bio
+    if body.topics is not None:
+        persona_fields['topics'] = json.dumps([t.model_dump() for t in body.topics])
+    if body.target_industries is not None:
+        persona_fields['target_industries'] = json.dumps(body.target_industries)
+    if body.min_honorarium is not None:
+        persona_fields['min_honorarium'] = body.min_honorarium
+    if body.years_experience is not None:
+        persona_fields['years_experience'] = body.years_experience
+    if body.location is not None:
+        persona_fields['location'] = body.location
+    if body.website is not None:
+        persona_fields['website'] = body.website
+    if body.credentials is not None:
+        persona_fields['credentials'] = body.credentials
+    if body.linkedin is not None:
+        persona_fields['linkedin'] = body.linkedin
+    if body.speaker_sheet is not None:
+        persona_fields['speaker_sheet'] = body.speaker_sheet
+    if body.notes is not None:
+        persona_fields['notes'] = body.notes
+    if body.conference_year is not None:
+        persona_fields['conference_year'] = body.conference_year
+    if body.conference_tier is not None:
+        persona_fields['conference_tier'] = body.conference_tier
+    if body.zip_code is not None:
+        persona_fields['zip_code'] = body.zip_code
+
+    if not speaker_fields and not persona_fields and not body.attachments:
         return {"id": record_id, **record.get("fields", {})}
 
     result = record
-    if fields:
-        result = at.update_speaker(record_id, fields)
+    if speaker_fields:
+        result = at.update_speaker(record_id, speaker_fields)
         if not result:
             raise HTTPException(status_code=500, detail="Failed to update speaker")
-        _rebuild_profile_json(speaker_id, result.get("fields", {}))
+
+    persona_result = None
+    persona_record_id = ''
+    if persona_fields:
+        persona = at.get_persona(speaker_id)
+        if persona:
+            persona_record_id = persona['id']
+            persona_result = at.update_persona(persona_record_id, persona_fields)
+        else:
+            # Persona row doesn't exist yet — create it
+            persona_fields['speaker_id'] = speaker_id
+            persona_result = at.create_persona(persona_fields)
+            if persona_result:
+                persona_record_id = persona_result['id']
+        if persona_result:
+            merged = {**(result.get("fields", {}) if result else {}),
+                      **persona_result.get("fields", {})}
+            _rebuild_profile_json(speaker_id, merged, persona_record_id)
 
     if body.attachments:
-        def _upload_attachments(rid: str, attachments):
-            field_name = os.getenv('AIRTABLE_ATTACHMENT_FIELD', 'Attachments')
-            _at = get_airtable()
-            for attachment in attachments:
-                try:
-                    _at.upload_attachment(rid, field_name, attachment.filename, attachment.content, attachment.type or 'application/octet-stream')
-                except Exception as e:
-                    logger.error(f"Failed to upload attachment '{attachment.filename}': {e}")
-        threading.Thread(
-            target=_upload_attachments,
-            args=(record_id, body.attachments),
-            daemon=True,
-        ).start()
+        # Resolve persona record ID — prefer already-fetched result, else query Airtable
+        persona_rid = (
+            persona_result['id'] if persona_result
+            else (at.get_persona(speaker_id) or {}).get('id')
+        )
+        if persona_rid:
+            def _upload_attachments(rid: str, attachments):
+                field_name = os.getenv('AIRTABLE_ATTACHMENT_FIELD', 'Attachments')
+                _at = get_airtable()
+                for attachment in attachments:
+                    try:
+                        _at.upload_attachment(rid, field_name, attachment.filename, attachment.content, attachment.type or 'application/octet-stream')
+                    except Exception as e:
+                        logger.error(f"Failed to upload attachment '{attachment.filename}': {e}")
+            threading.Thread(
+                target=_upload_attachments,
+                args=(persona_rid, body.attachments),
+                daemon=True,
+            ).start()
+        else:
+            logger.error(f"Cannot upload attachments for {speaker_id}: no Speaker_Persona record found")
 
-    return {"id": result["id"], **result.get("fields", {})}
+    # Return merged fields
+    merged_fields = {**record.get("fields", {})}
+    if result and result != record:
+        merged_fields.update(result.get("fields", {}))
+    if persona_result:
+        merged_fields.update(persona_result.get("fields", {}))
+    return {"id": record_id, **merged_fields}
 
 
-def _rebuild_profile_json(speaker_id: str, fields: dict):
-    """Rebuild speaker profile JSON file from Airtable fields."""
+def _rebuild_profile_json(speaker_id: str, fields: dict, persona_record_id: str = ''):
+    """Rebuild speaker profile JSON file from merged Speakers + Speaker_Persona fields."""
+    from src.api.profile_utils import build_profile_from_fields, save_profile
     try:
-        topics = []
-        raw_topics = fields.get('topics', '')
-        if raw_topics:
-            try:
-                topic_list = json.loads(raw_topics) if isinstance(raw_topics, str) else raw_topics
-                for t in topic_list:
-                    if isinstance(t, dict):
-                        topics.append({
-                            'topic': t.get('title', ''),
-                            'description': t.get('abstract', ''),
-                            'audience': t.get('audience', '')
-                        })
-                    else:
-                        topics.append({'topic': t, 'description': ''})
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        industries = []
-        raw_ind = fields.get('target_industries', '')
-        if raw_ind:
-            try:
-                industries = json.loads(raw_ind) if isinstance(raw_ind, str) else raw_ind
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        profile = {
-            'full_name': fields.get('full_name', speaker_id),
-            'credentials': fields.get('credentials', ''),
-            'professional_title': fields.get('tagline', ''),
-            'years_experience': fields.get('years_experience', 0),
-            'book_title': '',
-            'topics': topics if topics else [{'topic': 'General', 'description': ''}],
-            'target_industries': industries,
-            'target_geography': fields.get('location', 'National (US)'),
-            'min_honorarium': fields.get('min_honorarium', 0),
-            'discussion_points': [t['topic'] for t in topics][:10],
-            'linkedin': fields.get('linkedin', ''),
-            'website': fields.get('website', ''),
-            'speaker_sheet': fields.get('speaker_sheet', ''),
-            'notes': fields.get('notes', ''),
-            'conference_year': fields.get('conference_year', date.today().year),
-            'conference_tier': fields.get('conference_tier', ''),
-            'zip_code': fields.get('zip_code', ''),
-        }
-        if fields.get('bio'):
-            profile['bio'] = fields['bio']
-
-        profile_dir = Path('config/speaker_profiles')
-        profile_dir.mkdir(parents=True, exist_ok=True)
-        profile_path = profile_dir / f'{speaker_id}.json'
-        with open(profile_path, 'w') as f:
-            json.dump(profile, f, indent=2)
-        logger.info(f"Rebuilt profile JSON for {speaker_id}")
+        profile = build_profile_from_fields(fields)
+        save_profile(speaker_id, profile, persona_record_id)
+        logger.info(f"Rebuilt profile JSON for {speaker_id} (persona: {persona_record_id or 'default'})")
     except Exception as e:
         logger.error(f"Failed to rebuild profile JSON for {speaker_id}: {e}")
 
@@ -1479,7 +1413,11 @@ def _rebuild_profile_json(speaker_id: str, fields: dict):
 # ── Dashboard pipeline stats ────────────────────────────────
 
 @app.get("/api/dashboard/{speaker_id}/pipeline-stats")
-def pipeline_stats(speaker_id: str, _: None = Depends(verify_api_key)):
+def pipeline_stats(
+    speaker_id: str,
+    persona_id: Optional[str] = Query(None, description="Speaker_Persona record ID to scope stats"),
+    _: None = Depends(verify_api_key),
+):
     """Return the four headline stats for the speaker dashboard UI.
 
     Returns:
@@ -1491,7 +1429,7 @@ def pipeline_stats(speaker_id: str, _: None = Depends(verify_api_key)):
     from datetime import datetime, timedelta
 
     at = get_airtable()
-    all_leads = at.get_leads(speaker_id=speaker_id)
+    all_leads = at.get_leads(speaker_id=speaker_id, persona_id=persona_id or '')
 
     # Speaker min_honorarium for revenue estimate
     min_fee = 0
@@ -1625,6 +1563,7 @@ def pipeline_stats(speaker_id: str, _: None = Depends(verify_api_key)):
 @app.get("/api/dashboard/{speaker_id}")
 def dashboard(
     speaker_id: str,
+    persona_id: Optional[str] = Query(None, description="Speaker_Persona record ID to scope this dashboard"),
     status: Optional[str] = Query(None),
     type: Optional[str] = Query(None, description="Filter by lead type: Conference, Podcast, Corporate Events, Local Events, Other"),
     _: None = Depends(verify_api_key),
@@ -1632,10 +1571,17 @@ def dashboard(
     """Combined dashboard data: profile + stats + top leads."""
     at = get_airtable()
 
-    # Stats
-    stats = at.get_lead_stats(speaker_id)
+    # Resolve persona
+    if persona_id:
+        persona = at.get_persona_by_id(persona_id)
+    else:
+        persona = at.get_persona(speaker_id)
+    resolved_persona_id = persona["id"] if persona else None
 
-    all_leads = at.get_leads(speaker_id=speaker_id, status=status or '', lead_type=type or '')
+    # Stats
+    stats = at.get_lead_stats(speaker_id, persona_id=resolved_persona_id or '')
+
+    all_leads = at.get_leads(speaker_id=speaker_id, persona_id=resolved_persona_id or '', status=status or '', lead_type=type or '')
     sorted_leads = sorted(
         all_leads,
         key=lambda r: r.get('fields', {}).get('Match Score', 0),
@@ -1651,6 +1597,7 @@ def dashboard(
 
     return {
         "speaker": speaker_data,
+        "persona_id": resolved_persona_id,
         "stats": stats,
         "top_leads": top_leads,
     }

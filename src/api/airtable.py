@@ -52,11 +52,13 @@ class AirtableAPI:
 
     def __init__(self, api_key: str, base_id: str,
                  leads_table: str = 'Conferences',
-                 speakers_table: str = 'Speakers'):
+                 speakers_table: str = 'Speakers',
+                 persona_table: str = 'Speaker_Persona'):
         self.api_key = api_key
         self.base_id = base_id
         self.leads_table = leads_table
         self.speakers_table = speakers_table
+        self.persona_table = persona_table
         self.base_url = f'https://api.airtable.com/v0/{base_id}'
         self.headers = {
             'Authorization': f'Bearer {api_key}',
@@ -143,11 +145,14 @@ class AirtableAPI:
             return None
 
     def get_leads(self, speaker_id: str = '',
-                  status: str = '', triage: str = '', lead_type: str = '') -> list:
+                  status: str = '', triage: str = '', lead_type: str = '',
+                  persona_id: str = '') -> list:
         """Fetch leads with optional filters."""
         filters = []
         if speaker_id:
             filters.append(f"{{speaker_id}} = '{speaker_id}'")
+        if persona_id:
+            filters.append(f"{{persona_id}} = '{persona_id}'")
         if status:
             filters.append(f"{{Lead Status}} = '{status}'")
         if triage:
@@ -215,9 +220,9 @@ class AirtableAPI:
             logger.error(f"Failed to update lead {record_id}: {e}")
             return None
 
-    def get_lead_stats(self, speaker_id: str) -> dict:
+    def get_lead_stats(self, speaker_id: str, persona_id: str = '') -> dict:
         """Get aggregated stats for a speaker's leads."""
-        leads = self.get_leads(speaker_id=speaker_id)
+        leads = self.get_leads(speaker_id=speaker_id, persona_id=persona_id)
         stats = {
             'total': len(leads),
             'by_triage': {'RED': 0, 'YELLOW': 0, 'GREEN': 0},
@@ -458,6 +463,161 @@ class AirtableAPI:
             except Exception:
                 logger.error(f"Failed to update speaker {record_id}: {e}")
             return None
+
+    def delete_speaker(self, record_id: str) -> bool:
+        """Delete a speaker record by Airtable record ID."""
+        try:
+            resp = requests.delete(
+                f'{self.base_url}/{self.speakers_table}/{record_id}',
+                headers=self.headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete speaker {record_id}: {e}")
+            return False
+
+    # ── Speaker_Persona table ─────────────────────────────────
+
+    def list_personas(self, speaker_id: str) -> List[dict]:
+        """Fetch ALL persona records for a speaker_id."""
+        params = {'filterByFormula': f"{{speaker_id}} = '{speaker_id}'"}
+        all_records = []
+        offset = None
+        while True:
+            if offset:
+                params['offset'] = offset
+            try:
+                resp = requests.get(
+                    f'{self.base_url}/{self.persona_table}',
+                    headers=self.headers,
+                    params=params,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                all_records.extend(data.get('records', []))
+                offset = data.get('offset')
+                if not offset:
+                    break
+            except Exception as e:
+                logger.error(f"Failed to list personas for {speaker_id}: {e}")
+                break
+        return all_records
+
+    def get_persona_by_id(self, persona_id: str) -> Optional[dict]:
+        """Fetch a single persona record by Airtable record ID."""
+        try:
+            resp = requests.get(
+                f'{self.base_url}/{self.persona_table}/{persona_id}',
+                headers=self.headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to fetch persona {persona_id}: {e}")
+            return None
+
+    def get_persona(self, speaker_id: str) -> Optional[dict]:
+        """Fetch a persona record by speaker_id."""
+        params = {
+            'filterByFormula': f"{{speaker_id}} = '{speaker_id}'",
+            'pageSize': 1,
+        }
+        try:
+            resp = requests.get(
+                f'{self.base_url}/{self.persona_table}',
+                headers=self.headers,
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            records = resp.json().get('records', [])
+            return records[0] if records else None
+        except Exception as e:
+            logger.error(f"Failed to fetch persona {speaker_id}: {e}")
+            return None
+
+    def create_persona(self, fields: dict) -> Optional[dict]:
+        """Create a persona record in Speaker_Persona table."""
+        payload = {'fields': clean_payload(fields)}
+        logger.info(f"Creating persona with fields: {payload['fields']}")
+        try:
+            resp = requests.post(
+                f'{self.base_url}/{self.persona_table}',
+                headers=self.headers,
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code == 422:
+                logger.error(f"Airtable 422 creating persona: {resp.text}")
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            logger.error(f"Failed to create persona: {e}")
+            return None
+
+    def update_persona(self, record_id: str, fields: dict) -> Optional[dict]:
+        """Update a persona record."""
+        payload = {'fields': clean_payload(fields)}
+        try:
+            resp = requests.patch(
+                f'{self.base_url}/{self.persona_table}/{record_id}',
+                headers=self.headers,
+                json=payload,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            try:
+                logger.error(f"Failed to update persona {record_id}: {e} | response: {resp.text}")
+            except Exception:
+                logger.error(f"Failed to update persona {record_id}: {e}")
+            return None
+
+    def delete_persona(self, record_id: str) -> bool:
+        """Delete a persona record."""
+        try:
+            resp = requests.delete(
+                f'{self.base_url}/{self.persona_table}/{record_id}',
+                headers=self.headers,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete persona {record_id}: {e}")
+            return False
+
+    def list_active_personas(self) -> List[dict]:
+        """Get all personas with status='active'."""
+        params = {'filterByFormula': "{status} = 'active'"}
+        all_records = []
+        offset = None
+        while True:
+            if offset:
+                params['offset'] = offset
+            try:
+                resp = requests.get(
+                    f'{self.base_url}/{self.persona_table}',
+                    headers=self.headers,
+                    params=params,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                all_records.extend(data.get('records', []))
+                offset = data.get('offset')
+                if not offset:
+                    break
+            except Exception as e:
+                logger.error(f"Failed to list active personas: {e}")
+                break
+        return all_records
 
     def get_attachment_field_id(self, table_name: str, field_name: str) -> Optional[str]:
         """Return the Airtable field ID for an attachment field by table/field name."""

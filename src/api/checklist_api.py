@@ -4,23 +4,14 @@ import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
 from src.api.airtable import AirtableAPI
+from src.api.deps import verify_api_key as _verify_api_key
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-_api_key_header = APIKeyHeader(name='x-api-key', auto_error=False)
-
-
-def _verify_api_key(key: Optional[str] = Depends(_api_key_header)):
-    import os
-    expected = os.getenv('API_KEY', '')
-    if not expected or key != expected:
-        raise HTTPException(status_code=401, detail='Invalid or missing API key')
 
 
 def _get_airtable() -> AirtableAPI:

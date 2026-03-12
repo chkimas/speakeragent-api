@@ -41,6 +41,7 @@ def run_scout(
     speaker_id: str = 'leigh_vinocur',
     max_leads: Optional[int] = None,
     dry_run: bool = False,
+    persona_record_id: str = '',
 ) -> dict:
     """Run the full scouting pipeline.
 
@@ -242,6 +243,8 @@ def run_scout(
             lead_payload['Contact LinkedIn'] = scraped['linkedin_links'][0]
         if scraped.get('guest_form_url'):
             lead_payload['Guest Form URL'] = scraped['guest_form_url']
+        if persona_record_id:
+            lead_payload['persona_id'] = persona_record_id
         event_date_iso = _parse_date_to_iso(scraped.get('event_date_raw', ''))
         if event_date_iso:
             lead_payload['Event Date'] = event_date_iso

@@ -17,6 +17,7 @@ class Settings:
     # Table names in Airtable
     LEADS_TABLE = os.getenv('AIRTABLE_LEADS_TABLE', 'Conferences')
     SPEAKERS_TABLE = os.getenv('AIRTABLE_SPEAKERS_TABLE', 'Speakers')
+    PERSONA_TABLE = os.getenv('AIRTABLE_PERSONA_TABLE', 'Speaker_Persona')
 
     # Deployment / CORS
     CORS_ORIGINS = os.getenv('CORS_ORIGINS', 'http://localhost:3000')
