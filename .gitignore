@@ -11,3 +11,4 @@ build/
 settings
 .claude/
 .claude/settings.local.json
+frontend/node_modules
